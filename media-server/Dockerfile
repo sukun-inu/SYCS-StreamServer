@@ -1,5 +1,5 @@
 # CUDA_VERSION は FROM 命令で使うため全 stage より前に宣言する
-ARG CUDA_VERSION=12.3.1-runtime-ubuntu22.04
+ARG CUDA_VERSION=12.6.3-runtime-ubuntu24.04
 
 # Stage 1: mediamtx バイナリ取得
 FROM bluenviron/mediamtx:latest AS mediamtx

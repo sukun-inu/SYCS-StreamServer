@@ -4,19 +4,19 @@ version: "3.8"
 #  SYCS Stream Server — docker-compose.yml
 #  すべての設定値は .env (または Portainer の Environment 欄) で上書き可能
 #  ネットワークモード: host (全コンテナがホスト NW を共有)
-#  サイト公開: 別スタックの Cloudflare Tunnel に委譲
-#  RTMP 公開: ngrok TCP トンネル (ngrok-rtmp)
+#
+#  起動:           docker compose up -d --build
+#  イメージ再ビルド: docker compose build --no-cache [service]
+#  ログ確認:        docker compose logs -f [service]
 # ============================================================
 
 services:
 
-  # ── RTMP 受信 + FFmpeg NVENC エンコード + LL-HLS 生成 ──────────────────────
-  # イメージは GitHub Actions で ghcr.io にビルド済み。ローカルビルド不要。
+  # ── RTMP 受信 + FFmpeg NVENC エンコード + HLS 生成 ─────────────────────────
   media-server:
     build:
       context: ./media-server
       dockerfile: Dockerfile
-    image: ghcr.io/sukun-inu/sycs-media-server:latest
     container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     network_mode: host
     volumes:
@@ -44,10 +44,11 @@ services:
       start_period: 30s
 
   # ── HLS HTTP 配信 + ポータルサイト ──────────────────────────────────────────
-  # サイト外部公開は別スタックの Cloudflare Tunnel が担う
   # SITE_BASE_URL に Cloudflare の公開ドメインを設定するとポータルの URL 表示に反映される
   api-server:
-    image: ghcr.io/sukun-inu/sycs-api-server:latest
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile
     container_name: ${API_CONTAINER:-sycs-api-server}
     network_mode: host
     volumes:
@@ -61,7 +62,7 @@ services:
       - MAX_SESSIONS=${MAX_SESSIONS:-100}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-8.0}
       - QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-20.0}
-      - MAX_BPS=${MAX_BPS:-1375000}
+      - MAX_BPS=${MAX_BPS:-3000000}
     restart: ${RESTART_POLICY:-unless-stopped}
     depends_on:
       media-server:

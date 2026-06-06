@@ -39,7 +39,7 @@ NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://localhost:4040")
 _NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
 
 MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS",    "100"))
-SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "3.0"))   # 無活動でセッション失効 (秒)
+SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "8.0"))   # 無活動でセッション失効 (秒) — LL-HLSブロッキング最大5sより大きくする必要がある
 QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))   # キュー待機タイムアウト (秒)
 MAX_BPS         = int(os.environ.get("MAX_BPS", str(11 * 1_000_000 // 8)))  # 11 Mbps → bytes/s
 
@@ -143,7 +143,7 @@ async def _block_until_ready(
         async with _waiters_lock:
             _waiters[rel_path].append(ev)
         try:
-            await asyncio.wait_for(ev.wait(), timeout=min(remaining, 0.5))
+            await asyncio.wait_for(ev.wait(), timeout=min(remaining, 0.15))
         except asyncio.TimeoutError:
             async with _waiters_lock:
                 try:

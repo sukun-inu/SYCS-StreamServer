@@ -1,11 +1,5 @@
 #!/bin/bash
 # nginx-rtmp の exec_push から呼ばれる。$1 = ストリームキー
-#
-# 【fmp4 LL-HLS ABR VBR 2レベル】
-#   high/ … 元解像度、平均 VIDEO_BITRATE (VBR)
-#   low/  … 720p、平均 VIDEO_BITRATE_LOW (VBR)
-#   master.m3u8 に両バリアントを列挙。プレイヤーが帯域に応じて自動選択。
-#   LL-HLS 非対応プレイヤーはセグメント単位フォールバック (Android AVPro 等)。
 set -e
 
 STREAM_NAME="${1:?stream name required}"
@@ -28,7 +22,6 @@ cleanup() {
 trap cleanup EXIT TERM INT HUP
 
 # VBR パラメータ計算: maxrate = avg × 1.35、bufsize = maxrate × 2
-# 引数: "6000k" → "6000k 8100k 16200k"
 vbr_params() {
     local n="${1%k}"
     echo "${n}k $(( n * 135 / 100 ))k $(( n * 135 / 50 ))k"
@@ -36,9 +29,10 @@ vbr_params() {
 read -r BV_H BV_H_MAX BV_H_BUF <<< "$(vbr_params "${VIDEO_BITRATE}")"
 read -r BV_L BV_L_MAX BV_L_BUF <<< "$(vbr_params "${VIDEO_BITRATE_LOW}")"
 
-# ── NVENC / libx264 判定 ──────────────────────────────────────────────────────
-if ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda; then
-    echo "[publish:${STREAM_NAME}] NVENC (h264_nvenc) ABR VBR  high=${BV_H} low=${BV_L}"
+# h264_nvenc エンコーダの有無を確認する。
+# -hwaccels はデコード用アクセラレーション一覧であり NVENC (エンコーダ) は出ない。
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc'; then
+    echo "[publish:${STREAM_NAME}] h264_nvenc ABR VBR  high=${BV_H} low=${BV_L}"
     VC=(
         -c:v:0 h264_nvenc -rc:v:0 vbr -preset:v:0 llhq -tune:v:0 ll
         -b:v:0 "${BV_H}" -maxrate:v:0 "${BV_H_MAX}" -bufsize:v:0 "${BV_H_BUF}"
@@ -46,7 +40,7 @@ if ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda; then
         -b:v:1 "${BV_L}" -maxrate:v:1 "${BV_L_MAX}" -bufsize:v:1 "${BV_L_BUF}"
     )
 else
-    echo "[publish:${STREAM_NAME}] NVENC 不可 → libx264 ABR  high=${BV_H} low=${BV_L}"
+    echo "[publish:${STREAM_NAME}] h264_nvenc 不可 → libx264 ABR  high=${BV_H} low=${BV_L}"
     VC=(
         -c:v:0 libx264 -preset:v:0 ultrafast -tune:v:0 zerolatency
         -b:v:0 "${BV_H}" -maxrate:v:0 "${BV_H_MAX}" -bufsize:v:0 "${BV_H_BUF}"
@@ -55,10 +49,6 @@ else
     )
 fi
 
-# ── ABR fmp4 LL-HLS ──────────────────────────────────────────────────────────
-# split で映像を 2 系統に複製し、low 側を 720p にダウンスケールする。
-# ソースが 720p 以下の場合は scale=-2:720 がアップスケールするため、
-# その場合は VIDEO_BITRATE_LOW の解像度を下げるか low レンダリングを無効にすること。
 ffmpeg \
     -loglevel warning \
     -fflags +genpts \

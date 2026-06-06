@@ -1,7 +1,17 @@
 #!/bin/bash
-set -e
 
-STREAM_NAME="${1:?stream name required}"
+# ${1:?} より前に引数をログ (set -e なし、失敗しても続行)
+echo "$(date -u +%FT%TZ) [publish-debug] PID=$$ args=$# argv: $*" \
+    >> /tmp/publish_debug.log 2>&1 || true
+
+STREAM_NAME="${1}"
+if [ -z "${STREAM_NAME}" ]; then
+    echo "$(date -u +%FT%TZ) [publish-error] stream name empty, argv: $*" \
+        >> /tmp/publish_debug.log 2>&1 || true
+    exit 1
+fi
+
+set -e
 
 # exec_push は stdout/stderr を閉じるためファイルに出力する
 LOG="/tmp/publish_${STREAM_NAME}.log"

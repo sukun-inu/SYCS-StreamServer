@@ -1,0 +1,12 @@
+# ローカル開発用: docker compose build / up 時に自動マージされる
+# Portainer にはこのファイルを渡さないこと
+services:
+  media-server:
+    build:
+      context: ./media-server
+      dockerfile: Dockerfile
+
+  api-server:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile

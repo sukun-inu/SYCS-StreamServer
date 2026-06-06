@@ -13,9 +13,6 @@ services:
 
   # ── RTMP 受信 + FFmpeg NVENC エンコード + HLS 生成 ─────────────────────────
   media-server:
-    build:
-      context: ./media-server
-      dockerfile: Dockerfile
     image: ghcr.io/sukun-inu/sycs-media-server:latest
     container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     network_mode: host
@@ -46,9 +43,6 @@ services:
   # ── HLS HTTP 配信 + ポータルサイト ──────────────────────────────────────────
   # SITE_BASE_URL に Cloudflare の公開ドメインを設定するとポータルの URL 表示に反映される
   api-server:
-    build:
-      context: ./api-server
-      dockerfile: Dockerfile
     image: ghcr.io/sukun-inu/sycs-api-server:latest
     container_name: ${API_CONTAINER:-sycs-api-server}
     network_mode: host

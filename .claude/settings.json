@@ -2,6 +2,9 @@
   "permissions": {
     "additionalDirectories": [
       "c:\\Users\\Kawasaki\\.claude\\projects\\c--Users-Kawasaki-Desktop-Develop-SYCS-StreamServer\\memory"
+    ],
+    "allow": [
+      "Bash(git push *)"
     ]
   }
 }

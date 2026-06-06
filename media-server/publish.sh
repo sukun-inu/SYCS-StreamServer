@@ -1,6 +1,6 @@
 #!/bin/bash
-# mediamtx が環境変数 MTX_PATH="live/kawasaki" を渡す。
-# argv 渡しに依存しないため nginx-rtmp の exec_push 問題は発生しない。
+# mediamtx の runOnReady フックから呼び出される。
+# 環境変数 MTX_PATH="live/..." でストリームパスを受け取る。
 
 STREAM_NAME="${MTX_PATH%%/*}"
 if [ -z "${STREAM_NAME}" ]; then

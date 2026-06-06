@@ -20,6 +20,7 @@ OUTPUT_DIR="/hls/live/${STREAM_NAME}"
 mkdir -p "${OUTPUT_DIR}/high" "${OUTPUT_DIR}/low"
 
 cleanup() {
+    trap - EXIT TERM INT HUP
     [ -n "${PID}" ] && kill "${PID}" 2>/dev/null
     wait 2>/dev/null
     exit 0

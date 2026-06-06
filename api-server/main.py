@@ -154,7 +154,7 @@ async def list_streams():
                 continue
             streams.append({
                 "key":     sd.name,
-                "active":  (sd / "index.m3u8").exists(),
+                "active":  (sd / "high" / "index.m3u8").exists(),
                 "hls_url": f"/hls/live/{sd.name}/master.m3u8",
             })
     return {"streams": streams}

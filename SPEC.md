@@ -21,7 +21,7 @@
 |------|------|
 | 目的 | OBS → VRChat 向けライブ映像のリアルタイム配信 |
 | 目標遅延 | PC: **0.5〜1秒** / Android: **1〜1.5秒** (Cloudflare 経由) |
-| 配信プロトコル | fmp4 LL-HLS 単一ストリーム (PC / Android 共通 URL) |
+| 配信プロトコル | fmp4 LL-HLS ABR VBR (high/low 2レベル、PC / Android 共通 URL) |
 | 入力プロトコル | RTMP (OBS Studio 標準出力) |
 | エンコーダ | NVIDIA NVENC `h264_nvenc` (GTX1650)、libx264 自動フォールバック |
 | サイト公開 | Cloudflare Tunnel (別スタック管理) |
@@ -45,9 +45,10 @@
 | 公開ポート | `${RTMP_PORT:-1935}/tcp` |
 | 書き込みパス | `/hls/live/<key>/pc/` および `/hls/live/<key>/android/` |
 
-**単一ストリームの仕組み:**
+**ABR VBR ストリームの仕組み:**
 
-fmp4 LL-HLS は後方互換設計のため、LL-HLS 非対応プレイヤーでも動作する。
+fmp4 LL-HLS は後方互換設計のため、LL-HLS 非対応プレイヤーでも動作する。  
+master.m3u8 に高画質・低画質を列挙し、プレイヤーが帯域に応じて自動選択する。
 
 ```
 OBS (publisher)
@@ -55,31 +56,36 @@ OBS (publisher)
     ▼
 nginx-rtmp (exec_push → publish.sh)
     │
-    └── FFmpeg (subscriber) → /hls/live/{key}/  fmp4 LL-HLS
-                                ├── index.m3u8  (EXT-X-PART 付き)
-                                ├── master.m3u8
-                                ├── init.mp4
-                                └── seg*.m4s
+    └── FFmpeg (filter_complex split)
+         ├── /hls/live/{key}/high/  元解像度 VBR avg VIDEO_BITRATE
+         │    ├── master.m3u8 (ABR マスター ← ここに high/low 両方列挙)
+         │    ├── index.m3u8  (EXT-X-PART 付き)
+         │    ├── init_high.mp4
+         │    └── seg*.m4s
+         └── /hls/live/{key}/low/  720p VBR avg VIDEO_BITRATE_LOW
+              ├── index.m3u8
+              ├── init_low.mp4
+              └── seg*.m4s
 
-VRChat PC  → EXT-X-PART でパーツ単位取得 → ~0.5〜1s
-VRChat AND → EXT-X-PART を無視、セグメント単位 → ~1〜1.5s
+VRChat PC  → ABR 自動選択 + EXT-X-PART → ~0.5〜1s
+VRChat AND → ABR 自動選択 + セグメントフォールバック → ~1〜1.5s
 ```
 
 **FFmpeg コマンド詳細 (publish.sh):**
 
 ```bash
--fflags +genpts                   # PTS 欠損時に自動生成
--use_wallclock_as_timestamps 1    # タイムスタンプを壁時計に固定
--c:v h264_nvenc
--preset:v llhq / -tune:v ll       # 低遅延高品質プリセット
--rc:v cbr                         # 固定ビットレート
--g 60 / -keyint_min 60            # GOP 固定 (2秒@30fps)
--sc_threshold 0                   # シーンチェンジ検出無効
--c:a aac -ar 44100
--af aresample=async=1000          # 音声ドリフト自動補正
--hls_segment_type fmp4
--hls_flags ...+low_latency+program_date_time
--hls_part_duration 0.1
+# VBR パラメータ: maxrate = avg × 1.35、bufsize = maxrate × 2
+-filter_complex "[0:v]split=2[vh][vl];[vl]scale=-2:720[vls]"
+-map "[vh]"  -map 0:a   # high (v:0, a:0)
+-map "[vls]" -map 0:a   # low  (v:1, a:1)
+
+-c:v:0 h264_nvenc -rc:v:0 vbr -b:v:0 VIDEO_BITRATE    -maxrate:v:0 ... -bufsize:v:0 ...
+-c:v:1 h264_nvenc -rc:v:1 vbr -b:v:1 VIDEO_BITRATE_LOW -maxrate:v:1 ... -bufsize:v:1 ...
+-c:a:0 aac -b:a:0 AUDIO_BITRATE  # high 音声
+-c:a:1 aac -b:a:1 128k           # low 音声 (固定)
+
+-var_stream_map "v:0,a:0,name:high v:1,a:1,name:low"
+-master_pl_name master.m3u8
 ```
 
 ### 2.2 api-server
@@ -118,14 +124,18 @@ OBS
  │ RTMP :1935
  ▼
 nginx-rtmp (media-server)
- └── FFmpeg (h264_nvenc → fmp4 LL-HLS)
-      └─ /hls/live/{key}/
-           ├── init.mp4
-           ├── master.m3u8
-           ├── index.m3u8       ← EXT-X-PART 付き
-           ├── seg00001.m4s
-           ├── seg00002.0.m4s   ← パーツ (0.1s)
-           └── ...
+ └── FFmpeg (h264_nvenc → ABR fmp4 LL-HLS)
+      ├─ /hls/live/{key}/master.m3u8   ← ABR マスター (high/low を列挙)
+      ├─ /hls/live/{key}/high/
+      │    ├── index.m3u8              ← EXT-X-PART 付き
+      │    ├── init_high.mp4
+      │    ├── seg00001.m4s
+      │    ├── seg00002.0.m4s          ← パーツ (0.1s)
+      │    └── ...
+      └─ /hls/live/{key}/low/
+           ├── index.m3u8
+           ├── init_low.mp4
+           └── seg*.m4s
 
          ↓ Docker Volume 共有 (read-only)
 
@@ -328,10 +338,13 @@ HLS ファイル配信。
 
 | パス | 内容 |
 |------|------|
-| `/hls/live/{key}/master.m3u8` | マスタープレイリスト (PC / Android 共通) |
-| `/hls/live/{key}/index.m3u8` | メディアプレイリスト (EXT-X-PART 付き、パッチ済み) |
-| `/hls/live/{key}/init.mp4` | fmp4 初期化セグメント |
-| `/hls/live/{key}/seg*.m4s` | 完成セグメント / パーツ |
+| `/hls/live/{key}/master.m3u8` | ABR マスタープレイリスト (high/low 両バリアント列挙) |
+| `/hls/live/{key}/high/index.m3u8` | high メディアプレイリスト (EXT-X-PART 付き、パッチ済み) |
+| `/hls/live/{key}/high/init_high.mp4` | high fmp4 初期化セグメント |
+| `/hls/live/{key}/high/seg*.m4s` | high セグメント / パーツ |
+| `/hls/live/{key}/low/index.m3u8` | low メディアプレイリスト (720p、パッチ済み) |
+| `/hls/live/{key}/low/init_low.mp4` | low fmp4 初期化セグメント |
+| `/hls/live/{key}/low/seg*.m4s` | low セグメント / パーツ |
 
 **LL-HLS ブロッキングクエリパラメータ:**
 

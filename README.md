@@ -175,8 +175,9 @@ Portainer の **Stacks → Add stack → Repository** から:
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `RTMP_PORT` | `1935` | RTMP 受信ポート |
-| `VIDEO_BITRATE` | `4000k` | 映像ビットレート |
-| `AUDIO_BITRATE` | `128k` | 音声ビットレート |
+| `VIDEO_BITRATE` | `6000k` | high レンダリング映像平均ビットレート (maxrate は自動で 1.35 倍) |
+| `VIDEO_BITRATE_LOW` | `2000k` | low レンダリング映像平均ビットレート (720p) |
+| `AUDIO_BITRATE` | `320k` | high レンダリング音声上限 (low は 128k 固定) |
 | `HLS_SEGMENT_TIME` | `0.5` | セグメント長 (秒) |
 | `HLS_PART_DURATION` | `0.1` | LL-HLS パーツ長 (秒) |
 | `HLS_LIST_SIZE` | `6` | プレイリスト保持数 |

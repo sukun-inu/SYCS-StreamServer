@@ -1,21 +1,23 @@
 #!/bin/bash
 # nginx-rtmp の exec_push から呼ばれる。$1 = ストリームキー
 #
-# 【fmp4 LL-HLS 単一ストリーム】
-#   LL-HLS 対応プレイヤー (VRChat PC / HLS.js) → EXT-X-PART でパーツ単位取得 → ~0.5〜1s
-#   非対応プレイヤー (VRChat Android / AVPro Mobile) → EXT-X-PART を無視してセグメント単位 → ~1〜1.5s
-#   PC / Android 共通の単一 URL で配信。
+# 【fmp4 LL-HLS ABR VBR 2レベル】
+#   high/ … 元解像度、平均 VIDEO_BITRATE (VBR)
+#   low/  … 720p、平均 VIDEO_BITRATE_LOW (VBR)
+#   master.m3u8 に両バリアントを列挙。プレイヤーが帯域に応じて自動選択。
+#   LL-HLS 非対応プレイヤーはセグメント単位フォールバック (Android AVPro 等)。
 set -e
 
 STREAM_NAME="${1:?stream name required}"
-VIDEO_BITRATE="${VIDEO_BITRATE:-4000k}"
-AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
+VIDEO_BITRATE="${VIDEO_BITRATE:-6000k}"
+VIDEO_BITRATE_LOW="${VIDEO_BITRATE_LOW:-2000k}"
+AUDIO_BITRATE="${AUDIO_BITRATE:-320k}"
 HLS_SEGMENT_TIME="${HLS_SEGMENT_TIME:-0.5}"
 HLS_PART_DURATION="${HLS_PART_DURATION:-0.1}"
 HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 
 OUTPUT_DIR="/hls/live/${STREAM_NAME}"
-mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${OUTPUT_DIR}/high" "${OUTPUT_DIR}/low"
 
 cleanup() {
     [ -n "${PID}" ] && kill "${PID}" 2>/dev/null
@@ -24,52 +26,62 @@ cleanup() {
 }
 trap cleanup EXIT TERM INT HUP
 
+# VBR パラメータ計算: maxrate = avg × 1.35、bufsize = maxrate × 2
+# 引数: "6000k" → "6000k 8100k 16200k"
+vbr_params() {
+    local n="${1%k}"
+    echo "${n}k $(( n * 135 / 100 ))k $(( n * 135 / 50 ))k"
+}
+read -r BV_H BV_H_MAX BV_H_BUF <<< "$(vbr_params "${VIDEO_BITRATE}")"
+read -r BV_L BV_L_MAX BV_L_BUF <<< "$(vbr_params "${VIDEO_BITRATE_LOW}")"
+
 # ── NVENC / libx264 判定 ──────────────────────────────────────────────────────
 if ffmpeg -hide_banner -hwaccels 2>&1 | grep -q cuda; then
-    echo "[publish:${STREAM_NAME}] NVENC (h264_nvenc)"
+    echo "[publish:${STREAM_NAME}] NVENC (h264_nvenc) ABR VBR  high=${BV_H} low=${BV_L}"
     VC=(
-        -c:v h264_nvenc
-        -preset:v llhq
-        -tune:v ll
-        -rc:v cbr
-        -b:v "${VIDEO_BITRATE}"
-        -maxrate:v "${VIDEO_BITRATE}"
-        -bufsize:v "${VIDEO_BITRATE}"
+        -c:v:0 h264_nvenc -rc:v:0 vbr -preset:v:0 llhq -tune:v:0 ll
+        -b:v:0 "${BV_H}" -maxrate:v:0 "${BV_H_MAX}" -bufsize:v:0 "${BV_H_BUF}"
+        -c:v:1 h264_nvenc -rc:v:1 vbr -preset:v:1 llhq -tune:v:1 ll
+        -b:v:1 "${BV_L}" -maxrate:v:1 "${BV_L_MAX}" -bufsize:v:1 "${BV_L_BUF}"
     )
 else
-    echo "[publish:${STREAM_NAME}] NVENC 不可 → libx264"
+    echo "[publish:${STREAM_NAME}] NVENC 不可 → libx264 ABR  high=${BV_H} low=${BV_L}"
     VC=(
-        -c:v libx264
-        -preset ultrafast
-        -tune zerolatency
-        -b:v "${VIDEO_BITRATE}"
+        -c:v:0 libx264 -preset:v:0 ultrafast -tune:v:0 zerolatency
+        -b:v:0 "${BV_H}" -maxrate:v:0 "${BV_H_MAX}" -bufsize:v:0 "${BV_H_BUF}"
+        -c:v:1 libx264 -preset:v:1 ultrafast -tune:v:1 zerolatency
+        -b:v:1 "${BV_L}" -maxrate:v:1 "${BV_L_MAX}" -bufsize:v:1 "${BV_L_BUF}"
     )
 fi
 
-# ── fmp4 LL-HLS ───────────────────────────────────────────────────────────────
+# ── ABR fmp4 LL-HLS ──────────────────────────────────────────────────────────
+# split で映像を 2 系統に複製し、low 側を 720p にダウンスケールする。
+# ソースが 720p 以下の場合は scale=-2:720 がアップスケールするため、
+# その場合は VIDEO_BITRATE_LOW の解像度を下げるか low レンダリングを無効にすること。
 ffmpeg \
     -loglevel warning \
     -fflags +genpts \
     -use_wallclock_as_timestamps 1 \
     -i "rtmp://localhost:1935/live/${STREAM_NAME}" \
+    -filter_complex "[0:v]split=2[vh][vl];[vl]scale=-2:720[vls]" \
+    -map "[vh]"  -map 0:a \
+    -map "[vls]" -map 0:a \
     "${VC[@]}" \
-    -g 60 \
-    -keyint_min 60 \
-    -sc_threshold 0 \
-    -c:a aac \
-    -ar 44100 \
-    -b:a "${AUDIO_BITRATE}" \
-    -af "aresample=async=1000" \
+    -g:v:0 60 -keyint_min:v:0 60 -sc_threshold:v:0 0 \
+    -g:v:1 60 -keyint_min:v:1 60 -sc_threshold:v:1 0 \
+    -c:a:0 aac -ar:a:0 44100 -b:a:0 "${AUDIO_BITRATE}" -af:a:0 "aresample=async=1000" \
+    -c:a:1 aac -ar:a:1 44100 -b:a:1 128k              -af:a:1 "aresample=async=1000" \
     -f hls \
     -hls_time "${HLS_SEGMENT_TIME}" \
     -hls_list_size "${HLS_LIST_SIZE}" \
     -hls_flags delete_segments+split_by_time+low_latency+temp_file+program_date_time \
     -hls_segment_type fmp4 \
-    -hls_fmp4_init_filename init.mp4 \
+    -hls_fmp4_init_filename "init_%v.mp4" \
     -hls_part_duration "${HLS_PART_DURATION}" \
-    -hls_segment_filename "${OUTPUT_DIR}/seg%05d.m4s" \
+    -hls_segment_filename "${OUTPUT_DIR}/%v/seg%05d.m4s" \
     -master_pl_name master.m3u8 \
-    "${OUTPUT_DIR}/index.m3u8" &
+    -var_stream_map "v:0,a:0,name:high v:1,a:1,name:low" \
+    "${OUTPUT_DIR}/%v/index.m3u8" &
 PID=$!
 
 wait "${PID}" 2>/dev/null || true

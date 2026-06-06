@@ -1,14 +1,11 @@
 """
-SYCS Stream Server — LL-HLS / HLS 配信ポータル
+SYCS Stream Server — ABR fmp4 LL-HLS 配信ポータル
 
-出力2系統:
-  /hls/live/<key>/pc/      LL-HLS fmp4  (VRChat PC, ブラウザ)
-  /hls/live/<key>/android/ 標準 HLS TS  (VRChat Android)
+出力: /hls/live/<key>/master.m3u8 (ABR マスター)
+  high/ … 元解像度 VBR、LL-HLS 対応プレイヤーはパーツ単位取得
+  low/  … 720p  VBR、LL-HLS 非対応プレイヤー(Android)はセグメント単位フォールバック
 
-LL-HLS ブロッキングリクエスト (_HLS_msn / _HLS_part) により
-クライアントがポーリングなしでパーツ生成直後を受け取れる。
-
-playlist はサーブ時に自動パッチ処理:
+playlist サーブ時の自動パッチ:
   - EXT-X-PROGRAM-DATE-TIME 注入 (遅延蓄積防止)
   - HOLD-BACK 縮小             (ライブエッジ追従促進)
 """
@@ -20,14 +17,13 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 
 import aiofiles
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+import uvicorn
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
-import uvicorn
 
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
@@ -45,28 +41,25 @@ MEDIA_TYPES: dict[str, str] = {
 
 NO_CACHE_HEADERS = {
     "Cache-Control": "no-cache, no-store, must-revalidate",
-    "Pragma": "no-cache",
-    "Expires": "0",
-    "Access-Control-Allow-Origin": "*",
+    "Pragma":        "no-cache",
+    "Expires":       "0",
+    "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Headers": "*",
 }
 
 # ─── ngrok URL キャッシュ ─────────────────────────────────────────────────────
-#
-# ngrok-rtmp が :4040 に API を公開する。設定ファイル不要、env のみで制御する。
-# サイトベース URL は SITE_BASE_URL 環境変数から取得 (Cloudflare Tunnel の公開ドメイン)。
 
-_ngrok_cache: dict[str, str] = {}
-_ngrok_cache_ts: float = 0.0
+_ngrok_cache:    dict[str, str] = {}
+_ngrok_cache_ts: float          = 0.0
 
 
 async def get_ngrok_urls() -> dict[str, str]:
     global _ngrok_cache, _ngrok_cache_ts
-    now = asyncio.get_event_loop().time()
+    now = asyncio.get_running_loop().time()
     if now - _ngrok_cache_ts < _NGROK_TTL and _ngrok_cache:
         return _ngrok_cache
 
-    async def _fetch_tunnels(api_url: str) -> list[dict]:
+    async def _fetch(api_url: str) -> list[dict]:
         try:
             async with httpx.AsyncClient(timeout=3.0) as c:
                 r = await c.get(f"{api_url}/api/tunnels")
@@ -74,26 +67,22 @@ async def get_ngrok_urls() -> dict[str, str]:
         except Exception:
             return []
 
-    rtmp_tunnels = await _fetch_tunnels(NGROK_RTMP_API)
-
     result: dict[str, str] = {"site": SITE_BASE_URL, "rtmp": ""}
-
-    for t in rtmp_tunnels:
+    for t in await _fetch(NGROK_RTMP_API):
         pub = t.get("public_url", "")
         if pub.startswith("tcp://"):
-            # tcp://0.tcp.ngrok.io:PORT → rtmp://0.tcp.ngrok.io:PORT/live
             result["rtmp"] = "rtmp://" + pub[6:] + "/live"
             break
 
-    _ngrok_cache = result
+    _ngrok_cache    = result
     _ngrok_cache_ts = now
     return result
 
 
-# ─── LL-HLS ブロッキング管理 ─────────────────────────────────────────────────
+# ─── LL-HLS ブロッキング ──────────────────────────────────────────────────────
 
-_waiters: dict[str, list[asyncio.Event]] = defaultdict(list)
-_waiters_lock = asyncio.Lock()
+_waiters:      dict[str, list[asyncio.Event]] = defaultdict(list)
+_waiters_lock: asyncio.Lock                   = asyncio.Lock()
 
 
 async def _notify_waiters(rel_path: str) -> None:
@@ -116,107 +105,15 @@ async def _watch_hls() -> None:
         pass
 
 
-# ─── アプリ起動/停止 ──────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    HLS_DIR.mkdir(parents=True, exist_ok=True)
-    task = asyncio.create_task(_watch_hls())
-    yield
-    task.cancel()
-
-
-app = FastAPI(title="SYCS Stream Server", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "HEAD", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-# ─── ルート ───────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
-@app.get("/api/streams")
-async def list_streams():
-    """fmp4 LL-HLS ストリーム一覧。PC / Android 共通の単一 URL を返す。"""
-    streams = []
-    live_dir = HLS_DIR / "live"
-    if live_dir.exists():
-        for sd in sorted(live_dir.iterdir()):
-            if not sd.is_dir():
-                continue
-            streams.append({
-                "key":     sd.name,
-                "active":  (sd / "high" / "index.m3u8").exists(),
-                "hls_url": f"/hls/live/{sd.name}/master.m3u8",
-            })
-    return {"streams": streams}
-
-
-@app.get("/api/ngrok")
-async def ngrok_info():
-    """ngrok の公開 URL (HLS / RTMP) を返す。未起動時は空文字。"""
-    return await get_ngrok_urls()
-
-
-@app.get("/", response_class=HTMLResponse)
-async def portal():
-    return _PORTAL_HTML
-
-
-@app.get("/hls/{path:path}")
-async def serve_hls(
-    path: str,
-    request: Request,
-    _HLS_msn: Optional[int] = Query(default=None),
-    _HLS_part: Optional[int] = Query(default=None),
-):
-    """
-    HLS ファイル配信。
-    LL-HLS ブロッキングリクエスト (_HLS_msn/_HLS_part) 対応。
-    .m3u8 はパッチ処理 (PDT 注入・HOLD-BACK 縮小) してから返す。
-    """
-    file_path = HLS_DIR / path
-
-    if path.endswith(".m3u8") and _HLS_msn is not None:
-        await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
-
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Not found")
-
-    if path.endswith(".m3u8"):
-        try:
-            async with aiofiles.open(str(file_path), encoding="utf-8") as f:
-                content = await f.read()
-        except OSError:
-            raise HTTPException(status_code=404, detail="Not found")
-        return Response(
-            content=_patch_playlist(content).encode("utf-8"),
-            media_type="application/vnd.apple.mpegurl",
-            headers=NO_CACHE_HEADERS,
-        )
-
-    media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
-    return FileResponse(str(file_path), media_type=media_type, headers=NO_CACHE_HEADERS)
-
-
-# ─── LL-HLS ブロッキング ──────────────────────────────────────────────────────
-
 async def _block_until_ready(
-    rel_path: str,
+    rel_path:  str,
     file_path: Path,
-    msn: int,
-    part: Optional[int],
-    timeout: float,
+    msn:       int,
+    part:      int | None,
+    timeout:   float,
 ) -> None:
-    deadline = asyncio.get_event_loop().time() + timeout
+    loop     = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while True:
         if file_path.exists():
             try:
@@ -227,7 +124,7 @@ async def _block_until_ready(
             except OSError:
                 pass
 
-        remaining = deadline - asyncio.get_event_loop().time()
+        remaining = deadline - loop.time()
         if remaining <= 0:
             return
 
@@ -244,40 +141,32 @@ async def _block_until_ready(
                     pass
 
 
-def _playlist_satisfies(content: str, msn: int, part: Optional[int]) -> bool:
+def _playlist_satisfies(content: str, msn: int, part: int | None) -> bool:
     m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", content)
     if not m:
         return False
-    base = int(m.group(1))
+    base    = int(m.group(1))
     max_msn = base + content.count("#EXTINF:") - 1
     if msn > max_msn:
         return False
     if part is None:
         return True
     part_uris = re.findall(r'#EXT-X-PART:[^,\n]*,URI="([^"]+)"', content)
-    target = [u for u in part_uris if re.search(rf"seg{msn:05d}\.", u)]
-    return len(target) > part
+    return len([u for u in part_uris if re.search(rf"seg{msn:05d}\.", u)]) > part
 
 
 # ─── Playlist パッチ処理 ──────────────────────────────────────────────────────
 
 def _patch_playlist(content: str) -> str:
-    """
-    fmp4 LL-HLS playlist に適用。
-    1. EXT-X-PROGRAM-DATE-TIME が無ければ推定値を注入
-       → プレイヤーがライブエッジからの遅れを検知して自動追従する
-    2. EXT-X-SERVER-CONTROL の HOLD-BACK を縮小
-       → ライブエッジをより近くに保つ
-    """
+    """EXT-X-PROGRAM-DATE-TIME 注入と HOLD-BACK 縮小を適用する。"""
     if not content.strip() or "#EXTM3U" not in content:
         return content
 
-    has_pdt = "EXT-X-PROGRAM-DATE-TIME" in content
-    lines = content.splitlines(keepends=True)
-    out: list[str] = []
+    has_pdt     = "EXT-X-PROGRAM-DATE-TIME" in content
+    out:        list[str] = []
     pdt_inserted = False
 
-    for line in lines:
+    for line in content.splitlines(keepends=True):
         tag = line.rstrip("\r\n")
 
         if tag.startswith("#EXT-X-SERVER-CONTROL:"):
@@ -295,9 +184,9 @@ def _patch_playlist(content: str) -> str:
 
 
 def _shrink_hold_back(line: str) -> str:
-    def shrink(m: re.Match) -> str:
+    def _shrink(m: re.Match) -> str:
         return f"HOLD-BACK={max(0.75, float(m.group(1)) * 0.6):.3f}"
-    return re.sub(r"\bHOLD-BACK=([\d.]+)", shrink, line)
+    return re.sub(r"\bHOLD-BACK=([\d.]+)", _shrink, line)
 
 
 def _estimate_first_segment_pdt(content: str) -> str | None:
@@ -308,9 +197,91 @@ def _estimate_first_segment_pdt(content: str) -> str | None:
     return first.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+# ─── アプリ ───────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    HLS_DIR.mkdir(parents=True, exist_ok=True)
+    task = asyncio.create_task(_watch_hls())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="SYCS Stream Server", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+
+# ─── ルート ───────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/streams")
+async def list_streams():
+    """ABR fmp4 LL-HLS ストリーム一覧。PC / Android 共通の master.m3u8 URL を返す。"""
+    streams = []
+    live_dir = HLS_DIR / "live"
+    if live_dir.exists():
+        for sd in sorted(live_dir.iterdir()):
+            if not sd.is_dir():
+                continue
+            streams.append({
+                "key":     sd.name,
+                "active":  (sd / "high" / "index.m3u8").exists(),
+                "hls_url": f"/hls/live/{sd.name}/master.m3u8",
+            })
+    return {"streams": streams}
+
+
+@app.get("/api/ngrok")
+async def ngrok_info():
+    """ngrok RTMP URL と Cloudflare サイト URL を返す。ngrok 未起動時は rtmp が空文字。"""
+    return await get_ngrok_urls()
+
+
+@app.get("/hls/{path:path}")
+async def serve_hls(
+    path:      str,
+    _HLS_msn:  int | None = Query(default=None),
+    _HLS_part: int | None = Query(default=None),
+):
+    """HLS ファイル配信。LL-HLS ブロッキングリクエストと playlist パッチ処理に対応。"""
+    file_path = HLS_DIR / path
+
+    if path.endswith(".m3u8") and _HLS_msn is not None:
+        await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if path.endswith(".m3u8"):
+        try:
+            async with aiofiles.open(file_path, encoding="utf-8") as f:
+                content = await f.read()
+        except OSError:
+            raise HTTPException(status_code=404, detail="Not found")
+        return Response(
+            content=_patch_playlist(content).encode("utf-8"),
+            media_type="application/vnd.apple.mpegurl",
+            headers=NO_CACHE_HEADERS,
+        )
+
+    media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
+    return FileResponse(file_path, media_type=media_type, headers=NO_CACHE_HEADERS)
+
+
 # ─── ポータル HTML ────────────────────────────────────────────────────────────
 
-_PORTAL_HTML = r"""<!DOCTYPE html>
+_PORTAL_HTML = """<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
@@ -345,9 +316,8 @@ main{max-width:1120px;margin:0 auto;padding:16px;display:grid;gap:14px}
 .stream-key{flex:1;font-size:.9rem;font-weight:600;color:#e6edf3;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .platform-badges{display:flex;gap:4px;flex-shrink:0}
 .pb{font-size:.65rem;padding:2px 6px;border-radius:4px;font-weight:600}
-.pb.pc{background:#0d419d;color:#79c0ff}
-.pb.and{background:#1a4731;color:#56d364}
-.pb.off-badge{background:#21262d;color:#6e7681}
+.pb.live{background:#1a4731;color:#56d364}
+.pb.off{background:#21262d;color:#6e7681}
 .play-btn{background:#1f6feb;border:none;color:#fff;border-radius:6px;padding:4px 10px;font-size:.75rem;cursor:pointer;white-space:nowrap;flex-shrink:0}
 .play-btn:hover{background:#388bfd}
 
@@ -449,7 +419,7 @@ function setInput(id, val) {
 
 function playStream(key, url) {
   const video = document.getElementById('video');
-  const ph = document.getElementById('placeholder');
+  const ph    = document.getElementById('placeholder');
   ph.style.display = 'none';
   if (hlsObj) { hlsObj.destroy(); hlsObj = null; }
   playingKey = key;
@@ -487,9 +457,7 @@ async function refresh() {
 
   if (nRes.status === 'fulfilled') {
     const n = nRes.value;
-    if (n.site) {
-      extBase = n.site;
-    }
+    if (n.site) extBase = n.site;
     if (n.rtmp) {
       rtmpUrl = n.rtmp;
       document.getElementById('ngrok-alert').classList.add('show');
@@ -500,39 +468,36 @@ async function refresh() {
   if (sRes.status !== 'fulfilled') return;
   const { streams } = sRes.value;
 
-  // ストリーム一覧
   const listEl = document.getElementById('stream-list');
   if (!streams.length) {
     listEl.innerHTML = '<p style="color:#484f58;font-size:.85rem">配信なし</p>';
-    setInput('u-vrc', ''); setInput('u-browser', '');
+    setInput('u-vrc', '');
+    setInput('u-browser', '');
     return;
   }
 
-  listEl.innerHTML = streams.map(s => {
-    const badge = s.active
-      ? `<span class="pb and">LIVE</span>`
-      : `<span class="pb off-badge">OFF</span>`;
-    return `
-      <div class="stream-item">
-        <div class="dot ${s.active ? 'live' : 'off'}"></div>
-        <span class="stream-key">${s.key}</span>
-        <div class="platform-badges">${badge}</div>
-        ${s.active ? `<button class="play-btn" onclick="playStream('${s.key}','${localBase}${s.hls_url}')">▶</button>` : ''}
-      </div>`;
-  }).join('');
+  listEl.innerHTML = streams.map(s => `
+    <div class="stream-item">
+      <div class="dot ${s.active ? 'live' : 'off'}"></div>
+      <span class="stream-key">${s.key}</span>
+      <div class="platform-badges">
+        <span class="pb ${s.active ? 'live' : 'off'}">${s.active ? 'LIVE' : 'OFF'}</span>
+      </div>
+      ${s.active ? `<button class="play-btn" onclick="playStream('${s.key}','${localBase}${s.hls_url}')">▶</button>` : ''}
+    </div>`).join('');
 
-  // 最初の active ストリームの URL を接続情報に表示
   const active = streams.find(s => s.active);
-  if (!active) { setInput('u-vrc', ''); setInput('u-browser', ''); return; }
+  if (!active) {
+    setInput('u-vrc', '');
+    setInput('u-browser', '');
+    return;
+  }
 
   const hlsUrl = `${extBase}${active.hls_url}`;
-  setInput('u-vrc',     active.active ? hlsUrl : '');
-  setInput('u-browser', active.active ? hlsUrl : '');
+  setInput('u-vrc',     hlsUrl);
+  setInput('u-browser', hlsUrl);
 
-  // まだ再生していなければ自動再生
-  if (!playingKey && active.active) {
-    playStream(active.key, `${localBase}${active.hls_url}`);
-  }
+  if (!playingKey) playStream(active.key, `${localBase}${active.hls_url}`);
 }
 
 refresh();
@@ -540,6 +505,11 @@ setInterval(refresh, 4000);
 </script>
 </body>
 </html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def portal():
+    return _PORTAL_HTML
 
 
 # ─── 起動 ─────────────────────────────────────────────────────────────────────

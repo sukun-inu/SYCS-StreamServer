@@ -17,6 +17,7 @@ services:
       args:
         CUDA_VERSION: ${CUDA_VERSION:-12.3.1-runtime-ubuntu22.04}
     image: sycs-media-server:latest
+    pull_policy: build
     container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     network_mode: host
     volumes:
@@ -49,6 +50,7 @@ services:
   api-server:
     build: ./api-server
     image: sycs-api-server:latest
+    pull_policy: build
     container_name: ${API_CONTAINER:-sycs-api-server}
     network_mode: host
     volumes:

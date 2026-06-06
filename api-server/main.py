@@ -145,7 +145,7 @@ async def health():
 
 @app.get("/api/streams")
 async def list_streams():
-    """PC / Android 両方の HLS URL を含むストリーム一覧。"""
+    """fmp4 LL-HLS ストリーム一覧。PC / Android 共通の単一 URL を返す。"""
     streams = []
     live_dir = HLS_DIR / "live"
     if live_dir.exists():
@@ -153,11 +153,9 @@ async def list_streams():
             if not sd.is_dir():
                 continue
             streams.append({
-                "key": sd.name,
-                "active_pc":      (sd / "pc"      / "index.m3u8").exists(),
-                "active_android": (sd / "android" / "index.m3u8").exists(),
-                "hls_pc_url":      f"/hls/live/{sd.name}/pc/master.m3u8",
-                "hls_android_url": f"/hls/live/{sd.name}/android/index.m3u8",
+                "key":     sd.name,
+                "active":  (sd / "index.m3u8").exists(),
+                "hls_url": f"/hls/live/{sd.name}/master.m3u8",
             })
     return {"streams": streams}
 
@@ -265,11 +263,11 @@ def _playlist_satisfies(content: str, msn: int, part: Optional[int]) -> bool:
 
 def _patch_playlist(content: str) -> str:
     """
-    PC (LL-HLS fmp4) / Android (標準 HLS TS) 両方の playlist に適用。
+    fmp4 LL-HLS playlist に適用。
     1. EXT-X-PROGRAM-DATE-TIME が無ければ推定値を注入
        → プレイヤーがライブエッジからの遅れを検知して自動追従する
     2. EXT-X-SERVER-CONTROL の HOLD-BACK を縮小
-       → PC 向け LL-HLS でライブエッジをより近くに保つ
+       → ライブエッジをより近くに保つ
     """
     if not content.strip() or "#EXTM3U" not in content:
         return content
@@ -410,17 +408,10 @@ main{max-width:1120px;margin:0 auto;padding:16px;display:grid;gap:14px}
         </div>
       </div>
       <div class="url-row">
-        <span class="url-label">VRChat PC<br>(LL-HLS)</span>
+        <span class="url-label">VRChat URL<br>(PC / Android)</span>
         <div class="url-input-wrap">
-          <input id="u-pc" readonly class="empty" value="配信待機中">
-          <button class="copy-btn" onclick="cp('u-pc',this)">コピー</button>
-        </div>
-      </div>
-      <div class="url-row">
-        <span class="url-label">VRChat Android<br>(HLS TS)</span>
-        <div class="url-input-wrap">
-          <input id="u-and" readonly class="empty" value="配信待機中">
-          <button class="copy-btn" onclick="cp('u-and',this)">コピー</button>
+          <input id="u-vrc" readonly class="empty" value="配信待機中">
+          <button class="copy-btn" onclick="cp('u-vrc',this)">コピー</button>
         </div>
       </div>
       <div class="url-row">
@@ -513,34 +504,34 @@ async function refresh() {
   const listEl = document.getElementById('stream-list');
   if (!streams.length) {
     listEl.innerHTML = '<p style="color:#484f58;font-size:.85rem">配信なし</p>';
-    setInput('u-pc', ''); setInput('u-and', ''); setInput('u-browser', '');
+    setInput('u-vrc', ''); setInput('u-browser', '');
     return;
   }
 
   listEl.innerHTML = streams.map(s => {
-    const active = s.active_pc || s.active_android;
-    const pcBadge  = `<span class="pb ${s.active_pc ? 'pc' : 'off-badge'}">PC</span>`;
-    const andBadge = `<span class="pb ${s.active_android ? 'and' : 'off-badge'}">AND</span>`;
+    const badge = s.active
+      ? `<span class="pb and">LIVE</span>`
+      : `<span class="pb off-badge">OFF</span>`;
     return `
       <div class="stream-item">
-        <div class="dot ${active ? 'live' : 'off'}"></div>
+        <div class="dot ${s.active ? 'live' : 'off'}"></div>
         <span class="stream-key">${s.key}</span>
-        <div class="platform-badges">${pcBadge}${andBadge}</div>
-        ${active ? `<button class="play-btn" onclick="playStream('${s.key}','${localBase}${s.hls_pc_url}')">▶</button>` : ''}
+        <div class="platform-badges">${badge}</div>
+        ${s.active ? `<button class="play-btn" onclick="playStream('${s.key}','${localBase}${s.hls_url}')">▶</button>` : ''}
       </div>`;
   }).join('');
 
   // 最初の active ストリームの URL を接続情報に表示
-  const active = streams.find(s => s.active_pc || s.active_android);
-  if (!active) { setInput('u-pc',''); setInput('u-and',''); setInput('u-browser',''); return; }
+  const active = streams.find(s => s.active);
+  if (!active) { setInput('u-vrc', ''); setInput('u-browser', ''); return; }
 
-  setInput('u-pc',      active.active_pc      ? `${extBase}${active.hls_pc_url}`      : '');
-  setInput('u-and',     active.active_android ? `${extBase}${active.hls_android_url}` : '');
-  setInput('u-browser', active.active_pc      ? `${extBase}${active.hls_pc_url}`      : '');
+  const hlsUrl = `${extBase}${active.hls_url}`;
+  setInput('u-vrc',     active.active ? hlsUrl : '');
+  setInput('u-browser', active.active ? hlsUrl : '');
 
   // まだ再生していなければ自動再生
-  if (!playingKey && active.active_pc) {
-    playStream(active.key, `${localBase}${active.hls_pc_url}`);
+  if (!playingKey && active.active) {
+    playStream(active.key, `${localBase}${active.hls_url}`);
   }
 }
 

@@ -124,8 +124,12 @@ ngrok の公開 URL・VRChat URL・RTMP アドレスが表示されます。
 
 | プラットフォーム | 使う URL | 遅延 |
 |----------------|---------|------|
-| **VRChat PC** | 「VRChat PC」欄 (`/pc/master.m3u8`) | ~1〜1.5s |
-| **VRChat Android** | 「VRChat Android」欄 (`/android/index.m3u8`) | ~1.5〜3s |
+| **VRChat PC** | 「VRChat URL」欄 (`/master.m3u8`) | ~0.5〜1s |
+| **VRChat Android** | 同じ URL (LL-HLS フォールバック) | ~1〜1.5s |
+
+> PC / Android ともにポータルの「VRChat URL」欄の **同一 URL** を使います。  
+> fmp4 LL-HLS は後方互換設計なので、LL-HLS 非対応の Android AVPro でも  
+> セグメント単位で再生できます。
 
 ---
 

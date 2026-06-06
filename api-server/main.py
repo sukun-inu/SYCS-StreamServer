@@ -1,21 +1,16 @@
 """
 SYCS Stream Server — ABR fmp4 LL-HLS 配信ポータル
 
-出力: /hls/live/<key>/master.m3u8 (ABR マスター)
-  high/ … 元解像度 VBR、LL-HLS 対応プレイヤーはパーツ単位取得
-  low/  … 720p  VBR、LL-HLS 非対応プレイヤーはセグメント単位フォールバック
-
-セッション管理:
-  - master.m3u8 取得時に sid を発行、playlist URI に伝播
-  - 同時接続 MAX_SESSIONS 超過時はキュー待機 (QUEUE_TIMEOUT 秒でタイムアウト)
-  - 1秒あたりの受信バイト数が MAX_BPS を超えたセッションは強制終了
-
-playlist サーブ時の自動パッチ:
-  - EXT-X-PROGRAM-DATE-TIME 注入 (遅延蓄積防止)
-  - HOLD-BACK 縮小             (ライブエッジ追従促進)
+ポータル (/) : ストリーマー向け管理画面
+  - RTMP URL をリアルタイム表示 (WebSocket)
+  - ストリームキーを入力すると視聴 URL を生成
+視聴ページ (/watch/{key}) : キーを知る視聴者向けプレイヤー
+HLS 配信 (/hls/{path}) : ABR fmp4 LL-HLS + セッション管理
+WebSocket (/ws) : ngrok RTMP URL・セッション数をブラウザにプッシュ
 """
 
 import asyncio
+import json
 import os
 import re
 import uuid
@@ -27,7 +22,7 @@ from pathlib import Path
 import aiofiles
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
@@ -39,9 +34,11 @@ NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://localhost:4040")
 _NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
 
 MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS",    "100"))
-SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "8.0"))   # 無活動でセッション失効 (秒) — LL-HLSブロッキング最大5sより大きくする必要がある
-QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))   # キュー待機タイムアウト (秒)
-MAX_BPS         = int(os.environ.get("MAX_BPS", str(11 * 1_000_000 // 8)))  # 11 Mbps → bytes/s
+SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "8.0"))
+QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))
+MAX_BPS         = int(os.environ.get("MAX_BPS", str(11 * 1_000_000 // 8)))
+
+_KEY_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
 MEDIA_TYPES: dict[str, str] = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -70,24 +67,62 @@ async def get_ngrok_urls() -> dict[str, str]:
     if now - _ngrok_cache_ts < _NGROK_TTL and _ngrok_cache:
         return _ngrok_cache
 
-    async def _fetch(api_url: str) -> list[dict]:
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as c:
-                r = await c.get(f"{api_url}/api/tunnels")
-                return r.json().get("tunnels", [])
-        except Exception:
-            return []
-
     result: dict[str, str] = {"site": SITE_BASE_URL, "rtmp": ""}
-    for t in await _fetch(NGROK_RTMP_API):
-        pub = t.get("public_url", "")
-        if pub.startswith("tcp://"):
-            result["rtmp"] = "rtmp://" + pub[6:] + "/live"
-            break
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            r = await c.get(f"{NGROK_RTMP_API}/api/tunnels")
+            for t in r.json().get("tunnels", []):
+                pub = t.get("public_url", "")
+                if pub.startswith("tcp://"):
+                    result["rtmp"] = "rtmp://" + pub[6:] + "/live"
+                    break
+    except Exception:
+        pass
 
     _ngrok_cache    = result
     _ngrok_cache_ts = now
     return result
+
+
+# ─── WebSocket ブロードキャスト ───────────────────────────────────────────────
+
+_ws_clients: set[WebSocket] = set()
+
+
+async def _broadcast(msg: dict) -> None:
+    """全接続クライアントに JSON をプッシュ。切断済みクライアントは除去。"""
+    if not _ws_clients:
+        return
+    text = json.dumps(msg, ensure_ascii=False)
+    dead: set[WebSocket] = set()
+    for ws in list(_ws_clients):
+        try:
+            await ws.send_text(text)
+        except Exception:
+            dead.add(ws)
+    _ws_clients -= dead
+
+
+async def _current_status() -> dict:
+    urls = await get_ngrok_urls()
+    return {
+        "rtmp":     urls.get("rtmp", ""),
+        "site":     urls.get("site", ""),
+        "sessions": {"active": len(_sessions), "max": MAX_SESSIONS},
+    }
+
+
+async def _ws_broadcaster() -> None:
+    """ngrok URL とセッション数を 5 秒ごとに変化があればブロードキャスト。"""
+    prev: dict = {}
+    while True:
+        await asyncio.sleep(5.0)
+        if not _ws_clients:
+            continue
+        state = await _current_status()
+        if state != prev:
+            prev = state.copy()
+            await _broadcast(state)
 
 
 # ─── LL-HLS ブロッキング ──────────────────────────────────────────────────────
@@ -169,35 +204,28 @@ def _playlist_satisfies(content: str, msn: int, part: int | None) -> bool:
 # ─── Playlist パッチ処理 ──────────────────────────────────────────────────────
 
 def _patch_playlist(content: str) -> str:
-    """EXT-X-PROGRAM-DATE-TIME 注入と HOLD-BACK 縮小を適用する。"""
     if not content.strip() or "#EXTM3U" not in content:
         return content
-
-    has_pdt      = "EXT-X-PROGRAM-DATE-TIME" in content
-    out:         list[str] = []
+    has_pdt = "EXT-X-PROGRAM-DATE-TIME" in content
+    out: list[str] = []
     pdt_inserted = False
-
     for line in content.splitlines(keepends=True):
         tag = line.rstrip("\r\n")
-
         if tag.startswith("#EXT-X-SERVER-CONTROL:"):
             line = _shrink_hold_back(tag) + "\n"
-
         if not has_pdt and not pdt_inserted and tag.startswith("#EXTINF:"):
             pdt = _estimate_first_segment_pdt(content)
             if pdt:
                 out.append(f"#EXT-X-PROGRAM-DATE-TIME:{pdt}\n")
             pdt_inserted = True
-
         out.append(line)
-
     return "".join(out)
 
 
 def _shrink_hold_back(line: str) -> str:
-    def _shrink(m: re.Match) -> str:
+    def _s(m: re.Match) -> str:
         return f"HOLD-BACK={max(0.75, float(m.group(1)) * 0.6):.3f}"
-    return re.sub(r"\bHOLD-BACK=([\d.]+)", _shrink, line)
+    return re.sub(r"\bHOLD-BACK=([\d.]+)", _s, line)
 
 
 def _estimate_first_segment_pdt(content: str) -> str | None:
@@ -209,10 +237,7 @@ def _estimate_first_segment_pdt(content: str) -> str | None:
 
 
 def _inject_sid(content: str, sid: str) -> str:
-    """playlist 内のすべての URI に ?sid=<sid> を付与する。"""
-    # タグ内の URI="..." (? を含まないもの)
     content = re.sub(r'(URI="[^"?]+)"', rf'\1?sid={sid}"', content)
-    # 裸の URI 行 (# で始まらない行)
     out = []
     for line in content.splitlines(keepends=True):
         tag = line.rstrip("\r\n")
@@ -224,18 +249,13 @@ def _inject_sid(content: str, sid: str) -> str:
 
 
 # ─── セッション管理 ───────────────────────────────────────────────────────────
-#
-# master.m3u8 取得時に sid を発行し、playlist URI 書き換えで後続リクエストに伝播。
-# 満員時はキュー待機; タイムアウトで 503。
-# 1秒スライディングウィンドウの受信バイト数が MAX_BPS を超えたら強制終了。
 
-_sessions: dict[str, float]        = {}                   # sid → last_seen
-_bw:       dict[str, deque]        = defaultdict(deque)   # sid → deque[(ts, bytes)]
-_cap_cond: asyncio.Condition       = asyncio.Condition()
+_sessions: dict[str, float]  = {}
+_bw:       dict[str, deque]  = defaultdict(deque)
+_cap_cond: asyncio.Condition = asyncio.Condition()
 
 
 async def _acquire_session(sid: str | None) -> str:
-    """既存 sid を更新、または新規セッション取得 (満員時はキュー待機)。"""
     loop = asyncio.get_running_loop()
     async with _cap_cond:
         if sid and sid in _sessions:
@@ -257,7 +277,6 @@ async def _acquire_session(sid: str | None) -> str:
 
 
 async def _renew_session(sid: str) -> bool:
-    """既存セッションの更新。存在しなければ False を返す。"""
     loop = asyncio.get_running_loop()
     async with _cap_cond:
         if sid in _sessions:
@@ -267,7 +286,6 @@ async def _renew_session(sid: str) -> bool:
 
 
 def _check_and_record_bw(sid: str, nbytes: int) -> bool:
-    """帯域記録と上限チェック。MAX_BPS 超過なら False (切断すべき) を返す。"""
     now = asyncio.get_running_loop().time()
     dq  = _bw[sid]
     dq.append((now, nbytes))
@@ -277,7 +295,6 @@ def _check_and_record_bw(sid: str, nbytes: int) -> bool:
 
 
 async def _revoke_session(sid: str) -> None:
-    """セッション強制終了と待機中クライアントへの通知。"""
     async with _cap_cond:
         _sessions.pop(sid, None)
         _bw.pop(sid, None)
@@ -285,18 +302,21 @@ async def _revoke_session(sid: str) -> None:
 
 
 async def _cleanup_sessions() -> None:
-    """SESSION_TIMEOUT を超えた非アクティブセッションを毎秒削除し、空き枠を通知する。"""
     while True:
         await asyncio.sleep(1.0)
         loop = asyncio.get_running_loop()
         now  = loop.time()
+        freed = 0
         async with _cap_cond:
             expired = [s for s, ts in _sessions.items() if now - ts > SESSION_TIMEOUT]
             for s in expired:
                 _sessions.pop(s, None)
                 _bw.pop(s, None)
-            if expired:
+            freed = len(expired)
+            if freed:
                 _cap_cond.notify_all()
+        if freed:
+            asyncio.create_task(_broadcast(await _current_status()))
 
 
 # ─── アプリ ───────────────────────────────────────────────────────────────────
@@ -307,6 +327,7 @@ async def lifespan(_: FastAPI):
     tasks = [
         asyncio.create_task(_watch_hls()),
         asyncio.create_task(_cleanup_sessions()),
+        asyncio.create_task(_ws_broadcaster()),
     ]
     yield
     for t in tasks:
@@ -331,37 +352,44 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/api/streams")
-async def list_streams():
-    """ABR fmp4 LL-HLS ストリーム一覧。PC / Android 共通の master.m3u8 URL を返す。"""
-    streams = []
-    live_dir = HLS_DIR / "live"
-    if live_dir.exists():
-        for sd in sorted(live_dir.iterdir()):
-            if not sd.is_dir():
-                continue
-            streams.append({
-                "key":     sd.name,
-                "active":  (sd / "high" / "index.m3u8").exists(),
-                "hls_url": f"/hls/live/{sd.name}/master.m3u8",
-            })
-    return {"streams": streams}
-
-
-@app.get("/api/ngrok")
-async def ngrok_info():
-    """ngrok RTMP URL と Cloudflare サイト URL を返す。ngrok 未起動時は rtmp が空文字。"""
-    return await get_ngrok_urls()
+@app.get("/api/stream/{key}")
+async def stream_info(key: str):
+    """指定キーのストリーム状態を返す。配信一覧は公開しない。"""
+    if not _KEY_RE.match(key):
+        raise HTTPException(400, "無効なストリームキーです。")
+    stream_dir = HLS_DIR / "live" / key
+    active = (stream_dir / "high" / "index.m3u8").exists()
+    return {
+        "key":     key,
+        "active":  active,
+        "hls_url": f"/hls/live/{key}/master.m3u8",
+    }
 
 
 @app.get("/api/status")
 async def server_status():
-    """現在のセッション数とキャパシティを返す。"""
     return {
         "active":    len(_sessions),
         "max":       MAX_SESSIONS,
         "available": max(0, MAX_SESSIONS - len(_sessions)),
     }
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    """ngrok RTMP URL とセッション数をリアルタイムでプッシュする。"""
+    await ws.accept()
+    _ws_clients.add(ws)
+    try:
+        await ws.send_text(json.dumps(await _current_status(), ensure_ascii=False))
+        while True:
+            # Cloudflare Tunnel の idle タイムアウト対策に定期 ping
+            await asyncio.sleep(30)
+            await ws.send_text(json.dumps({"ping": True}))
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        _ws_clients.discard(ws)
 
 
 @app.get("/hls/{path:path}")
@@ -371,31 +399,28 @@ async def serve_hls(
     _HLS_msn:  int | None = Query(default=None),
     _HLS_part: int | None = Query(default=None),
 ):
-    """
-    HLS ファイル配信。
-    - master.m3u8 : セッション確立 (満員時キュー待機)、URI に sid を付与して返す
-    - index.m3u8  : セッション更新、LL-HLS ブロッキング対応
-    - セグメント  : 帯域チェック (MAX_BPS 超過でセッション強制終了)
-    """
     file_path   = HLS_DIR / path
     is_master   = path.endswith("master.m3u8")
     is_playlist = path.endswith("index.m3u8")
 
-    # ── セッション管理 ────────────────────────────────────────────────────────
+    # パストラバーサル防止
+    try:
+        file_path.relative_to(HLS_DIR)
+    except ValueError:
+        raise HTTPException(400, "Invalid path")
+
     if is_master:
-        sid = await _acquire_session(sid)          # 満員ならキュー待機
+        sid = await _acquire_session(sid)
     elif is_playlist:
         if sid and not await _renew_session(sid):
             raise HTTPException(403, "セッション期限切れ。再度アクセスしてください。")
 
-    # ── LL-HLS ブロッキング ───────────────────────────────────────────────────
     if is_playlist and _HLS_msn is not None:
         await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Not found")
 
-    # ── Playlist 配信 ─────────────────────────────────────────────────────────
     if path.endswith(".m3u8"):
         try:
             async with aiofiles.open(file_path, encoding="utf-8") as f:
@@ -411,7 +436,6 @@ async def serve_hls(
             headers=NO_CACHE_HEADERS,
         )
 
-    # ── セグメント / パーツ配信 ───────────────────────────────────────────────
     if sid:
         try:
             nbytes = file_path.stat().st_size
@@ -425,9 +449,10 @@ async def serve_hls(
     return FileResponse(file_path, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
-# ─── ポータル HTML ────────────────────────────────────────────────────────────
+# ─── HTML ─────────────────────────────────────────────────────────────────────
 
-_PORTAL_HTML = """<!DOCTYPE html>
+_PORTAL_HTML = """\
+<!DOCTYPE html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
@@ -436,144 +461,198 @@ _PORTAL_HTML = """<!DOCTYPE html>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
-header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:12px}
-header h1{font-size:1.15rem;font-weight:700;color:#58a6ff}
-.badge{background:#1f6feb;color:#fff;font-size:.68rem;padding:2px 8px;border-radius:10px;font-weight:600;letter-spacing:.04em}
-#cap-badge{background:#1a4731;color:#56d364;margin-left:auto}
-main{max-width:1120px;margin:0 auto;padding:16px;display:grid;gap:14px}
-@media(min-width:800px){main{grid-template-columns:1fr 340px}}
-
-/* Player */
-#player-wrap{background:#000;border-radius:8px;overflow:hidden;aspect-ratio:16/9;position:relative;grid-row:1}
-#player-wrap video{width:100%;height:100%;display:block}
-.placeholder{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#484f58;font-size:.9rem}
-.placeholder svg{width:52px;opacity:.25}
-
-/* Card */
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;grid-row:span 1}
-.card h2{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:#8b949e;margin-bottom:12px;font-weight:600}
-@media(min-width:800px){.card:nth-of-type(1){grid-column:2;grid-row:1/3}}
-
-/* Stream list */
-.stream-item{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #21262d}
-.stream-item:last-child{border-bottom:none}
-.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.dot.live{background:#3fb950;box-shadow:0 0 5px #3fb950}
-.dot.off{background:#484f58}
-.stream-key{flex:1;font-size:.9rem;font-weight:600;color:#e6edf3;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.platform-badges{display:flex;gap:4px;flex-shrink:0}
-.pb{font-size:.65rem;padding:2px 6px;border-radius:4px;font-weight:600}
-.pb.live{background:#1a4731;color:#56d364}
-.pb.off{background:#21262d;color:#6e7681}
-.play-btn{background:#1f6feb;border:none;color:#fff;border-radius:6px;padding:4px 10px;font-size:.75rem;cursor:pointer;white-space:nowrap;flex-shrink:0}
-.play-btn:hover{background:#388bfd}
-
-/* URL rows */
-.url-section{display:flex;flex-direction:column;gap:7px;margin-top:4px}
-.url-row{display:flex;align-items:center;gap:8px}
-.url-label{font-size:.7rem;color:#8b949e;width:86px;flex-shrink:0;line-height:1.2}
-.url-input-wrap{flex:1;display:flex;gap:5px;min-width:0}
-.url-input-wrap input{flex:1;min-width:0;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:5px 9px;color:#58a6ff;font-family:monospace;font-size:.75rem;cursor:text}
-.url-input-wrap input.empty{color:#484f58}
-.copy-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:4px 9px;font-size:.72rem;cursor:pointer;white-space:nowrap;flex-shrink:0}
-.copy-btn:hover{background:#30363d}
-.copy-btn.ok{color:#3fb950;border-color:#3fb950}
-
-/* Alert */
-.alert{background:#1c2128;border:1px solid #9e6a03;border-radius:6px;padding:9px 12px;font-size:.75rem;color:#d29922;margin-bottom:10px;display:none}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:10px}
+header h1{font-size:1.1rem;font-weight:700;color:#58a6ff}
+.chip{background:#1f6feb;color:#fff;font-size:.65rem;padding:2px 7px;border-radius:10px;font-weight:600}
+#cap{margin-left:auto;font-size:.75rem;color:#56d364}
+main{max-width:640px;margin:32px auto;padding:0 16px;display:flex;flex-direction:column;gap:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 20px}
+.card h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:#8b949e;margin-bottom:14px;font-weight:600}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.row:last-child{margin-bottom:0}
+label{font-size:.75rem;color:#8b949e;width:96px;flex-shrink:0}
+input[type=text]{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;color:#e6edf3;font-family:monospace;font-size:.8rem;min-width:0}
+input[readonly]{color:#58a6ff}
+input.empty{color:#484f58}
+.btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:5px 12px;font-size:.75rem;cursor:pointer;white-space:nowrap;flex-shrink:0}
+.btn:hover{background:#30363d}
+.btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn.primary:hover{background:#388bfd}
+.btn.ok{color:#3fb950;border-color:#3fb950}
+.alert{background:#1c2128;border:1px solid #9e6a03;border-radius:6px;padding:8px 12px;font-size:.75rem;color:#d29922;margin-bottom:12px;display:none}
 .alert.show{display:block}
-
-/* Info card */
-#info-card{grid-column:1}
-@media(min-width:800px){#info-card{grid-column:1}}
+#stream-result{display:none;margin-top:12px;padding-top:12px;border-top:1px solid #21262d}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.live{background:#3fb950;box-shadow:0 0 5px #3fb950}.off{background:#484f58}
 </style>
 </head>
 <body>
 <header>
   <h1>SYCS Stream Server</h1>
-  <span class="badge">LL-HLS</span>
-  <span class="badge" id="cap-badge">● 0 / 0</span>
+  <span class="chip">LL-HLS</span>
+  <span id="cap" title="接続中 / 最大">● 0 / 0</span>
 </header>
-
 <main>
-  <!-- ストリーム一覧 (右カラム) -->
-  <div class="card" id="stream-card">
-    <h2>配信一覧</h2>
-    <div id="stream-list"><p style="color:#484f58;font-size:.85rem">配信なし</p></div>
+
+  <div class="card">
+    <h2>OBS 配信設定</h2>
+    <div class="alert" id="ngrok-alert">⚠ ngrok 無料プランでは再起動ごとに RTMP URL が変わります。</div>
+    <div class="row">
+      <label>RTMP URL</label>
+      <input id="u-rtmp" type="text" readonly class="empty" value="取得中...">
+      <button class="btn" onclick="cp('u-rtmp',this)">コピー</button>
+    </div>
+    <div class="row">
+      <label>ストリームキー</label>
+      <span style="font-size:.8rem;color:#8b949e">OBS で任意の値を設定してください</span>
+    </div>
   </div>
 
-  <!-- プレイヤー (左上) -->
-  <div id="player-wrap">
-    <video id="video" controls playsinline></video>
-    <div class="placeholder" id="placeholder">
-      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-      <span>配信待機中</span>
+  <div class="card">
+    <h2>視聴 URL 生成</h2>
+    <div class="row">
+      <label>ストリームキー</label>
+      <input id="key-input" type="text" placeholder="例: stream">
+      <button class="btn primary" onclick="checkStream()">確認</button>
+    </div>
+    <div id="stream-result">
+      <div class="row" style="margin-bottom:8px">
+        <span class="status-dot" id="s-dot"></span>
+        <span id="s-label" style="font-size:.85rem;font-weight:600"></span>
+      </div>
+      <div class="row">
+        <label>VRChat URL</label>
+        <input id="u-vrc" type="text" readonly class="empty" value="">
+        <button class="btn" onclick="cp('u-vrc',this)">コピー</button>
+      </div>
+      <div class="row">
+        <label>視聴ページ</label>
+        <input id="u-watch" type="text" readonly class="empty" value="">
+        <button class="btn" onclick="openWatch()">開く</button>
+        <button class="btn" onclick="cp('u-watch',this)">コピー</button>
+      </div>
     </div>
   </div>
 
-  <!-- 接続情報 (左下) -->
-  <div class="card" id="info-card">
-    <h2>接続情報</h2>
-    <div class="alert" id="ngrok-alert">
-      ⚠ ngrok 無料プランでは RTMP URL が再起動ごとに変わります。OBS の配信先 URL は ngrok-rtmp 再起動後にポータルで確認してください。
-    </div>
-    <div class="url-section" id="url-section">
-      <div class="url-row">
-        <span class="url-label">RTMP<br>(OBS 配信先)</span>
-        <div class="url-input-wrap">
-          <input id="u-rtmp" readonly value="読み込み中...">
-          <button class="copy-btn" onclick="cp('u-rtmp',this)">コピー</button>
-        </div>
-      </div>
-      <div class="url-row">
-        <span class="url-label">VRChat URL<br>(PC / Android)</span>
-        <div class="url-input-wrap">
-          <input id="u-vrc" readonly class="empty" value="配信待機中">
-          <button class="copy-btn" onclick="cp('u-vrc',this)">コピー</button>
-        </div>
-      </div>
-      <div class="url-row">
-        <span class="url-label">ブラウザ再生</span>
-        <div class="url-input-wrap">
-          <input id="u-browser" readonly class="empty" value="配信待機中">
-          <button class="copy-btn" onclick="cp('u-browser',this)">コピー</button>
-        </div>
-      </div>
-    </div>
-  </div>
 </main>
-
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
-let hlsObj = null;
-let playingKey = null;
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+let ws, reconnectTimer;
 
-function cp(id, btn) {
-  const val = document.getElementById(id)?.value;
-  if (!val || val.startsWith('配信') || val.startsWith('読み込み')) return;
-  navigator.clipboard.writeText(val).then(() => {
-    btn.textContent = '✓ コピー済';
-    btn.classList.add('ok');
-    setTimeout(() => { btn.textContent = 'コピー'; btn.classList.remove('ok'); }, 2000);
-  });
+function connectWS() {
+  ws = new WebSocket(`${wsProto}//${location.host}/ws`);
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.ping) return;
+    if (d.rtmp) {
+      setVal('u-rtmp', d.rtmp, false);
+      document.getElementById('ngrok-alert').classList.add('show');
+    }
+    if (d.sessions) {
+      const s = d.sessions;
+      const pct = s.max > 0 ? s.active / s.max : 0;
+      const el = document.getElementById('cap');
+      el.textContent = `● ${s.active} / ${s.max}`;
+      el.style.color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
+    }
+  };
+  ws.onclose = () => { reconnectTimer = setTimeout(connectWS, 4000); };
+  ws.onerror = () => ws.close();
 }
+connectWS();
 
-function setInput(id, val) {
+function setVal(id, val, empty) {
   const el = document.getElementById(id);
   if (!el) return;
   el.value = val;
-  el.classList.toggle('empty', !val);
+  el.classList.toggle('empty', empty || !val);
 }
 
-function playStream(key, url) {
-  const video = document.getElementById('video');
-  const ph    = document.getElementById('placeholder');
-  ph.style.display = 'none';
-  if (hlsObj) { hlsObj.destroy(); hlsObj = null; }
-  playingKey = key;
+function cp(id, btn) {
+  const v = document.getElementById(id)?.value;
+  if (!v || document.getElementById(id).classList.contains('empty')) return;
+  navigator.clipboard.writeText(v).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = '✓'; btn.classList.add('ok');
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('ok'); }, 2000);
+  });
+}
 
+function openWatch() {
+  const v = document.getElementById('u-watch')?.value;
+  if (v && !document.getElementById('u-watch').classList.contains('empty')) window.open(v, '_blank');
+}
+
+async function checkStream() {
+  const key = document.getElementById('key-input').value.trim();
+  if (!key) return;
+  const res = document.getElementById('stream-result');
+  res.style.display = 'block';
+
+  try {
+    const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
+    if (!r.ok) { showStatus(false, '無効なキーです'); return; }
+    const d = await r.json();
+    const extBase = (typeof _siteBase !== 'undefined' && _siteBase) ? _siteBase : location.origin;
+    const hlsUrl  = `${extBase}${d.hls_url}`;
+    const watchUrl = `${extBase}/watch/${encodeURIComponent(key)}`;
+
+    showStatus(d.active, d.active ? 'LIVE' : '待機中');
+    setVal('u-vrc',   hlsUrl,   false);
+    setVal('u-watch', watchUrl, false);
+  } catch {
+    showStatus(false, '取得失敗');
+  }
+}
+
+function showStatus(live, label) {
+  const dot = document.getElementById('s-dot');
+  const lbl = document.getElementById('s-label');
+  dot.className = 'status-dot ' + (live ? 'live' : 'off');
+  lbl.textContent = label;
+}
+
+document.getElementById('key-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') checkStream();
+});
+</script>
+</body>
+</html>
+"""
+
+_WATCH_HTML = """\
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>視聴中 — SYCS</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+#wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain}
+#msg{position:absolute;color:#484f58;font-family:'Segoe UI',system-ui,sans-serif;font-size:.9rem;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" controls autoplay playsinline></video>
+  <p id="msg">配信待機中...</p>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+const KEY = __KEY_JSON__;
+const HLS_URL = `/hls/live/${KEY}/master.m3u8`;
+let hls = null;
+let polling = null;
+
+function startPlayer() {
+  const video = document.getElementById('v');
+  document.getElementById('msg').style.display = 'none';
+  if (hls) { hls.destroy(); hls = null; }
   if (Hls.isSupported()) {
-    hlsObj = new Hls({
+    hls = new Hls({
       lowLatencyMode: true,
       backBufferLength: 2,
       maxBufferLength: 4,
@@ -581,95 +660,62 @@ function playStream(key, url) {
       liveMaxLatencyDurationCount: 5,
       liveDurationInfinity: true,
     });
-    hlsObj.loadSource(url);
-    hlsObj.attachMedia(video);
-    hlsObj.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-    hlsObj.on(Hls.Events.ERROR, (_, d) => {
-      if (d.fatal) { ph.style.display = 'flex'; playingKey = null; }
+    hls.loadSource(HLS_URL);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (_, d) => {
+      if (d.fatal) { hls.destroy(); hls = null; startPolling(); }
     });
   } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = url;
+    video.src = HLS_URL;
     video.play().catch(() => {});
   }
 }
 
-async function refresh() {
-  const [sRes, nRes, stRes] = await Promise.allSettled([
-    fetch('/api/streams').then(r => r.json()),
-    fetch('/api/ngrok').then(r => r.json()),
-    fetch('/api/status').then(r => r.json()),
-  ]);
-
-  // キャパシティ表示
-  if (stRes.status === 'fulfilled') {
-    const st = stRes.value;
-    const pct = st.max > 0 ? st.active / st.max : 0;
-    const color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
-    const el = document.getElementById('cap-badge');
-    el.textContent = `● ${st.active} / ${st.max}`;
-    el.style.color = color;
-    el.style.background = pct >= 1 ? '#2d1b1b' : pct >= 0.8 ? '#2d2007' : '#1a4731';
-  }
-
-  const localBase = location.origin;
-  let extBase = localBase;
-  let rtmpUrl = 'rtmp://[サーバーIP]:1935/live  ← IPに置換してください';
-
-  if (nRes.status === 'fulfilled') {
-    const n = nRes.value;
-    if (n.site) extBase = n.site;
-    if (n.rtmp) {
-      rtmpUrl = n.rtmp;
-      document.getElementById('ngrok-alert').classList.add('show');
-    }
-  }
-  setInput('u-rtmp', rtmpUrl);
-
-  if (sRes.status !== 'fulfilled') return;
-  const { streams } = sRes.value;
-
-  const listEl = document.getElementById('stream-list');
-  if (!streams.length) {
-    listEl.innerHTML = '<p style="color:#484f58;font-size:.85rem">配信なし</p>';
-    setInput('u-vrc', '');
-    setInput('u-browser', '');
-    return;
-  }
-
-  listEl.innerHTML = streams.map(s => `
-    <div class="stream-item">
-      <div class="dot ${s.active ? 'live' : 'off'}"></div>
-      <span class="stream-key">${s.key}</span>
-      <div class="platform-badges">
-        <span class="pb ${s.active ? 'live' : 'off'}">${s.active ? 'LIVE' : 'OFF'}</span>
-      </div>
-      ${s.active ? `<button class="play-btn" onclick="playStream('${s.key}','${localBase}${s.hls_url}')">▶</button>` : ''}
-    </div>`).join('');
-
-  const active = streams.find(s => s.active);
-  if (!active) {
-    setInput('u-vrc', '');
-    setInput('u-browser', '');
-    return;
-  }
-
-  const hlsUrl = `${extBase}${active.hls_url}`;
-  setInput('u-vrc',     hlsUrl);
-  setInput('u-browser', hlsUrl);
-
-  if (!playingKey) playStream(active.key, `${localBase}${active.hls_url}`);
+async function checkActive() {
+  try {
+    const r = await fetch(`/api/stream/${encodeURIComponent(KEY)}`);
+    if (!r.ok) return false;
+    return (await r.json()).active;
+  } catch { return false; }
 }
 
-refresh();
-setInterval(refresh, 4000);
+function startPolling() {
+  document.getElementById('msg').style.display = '';
+  if (polling) return;
+  polling = setInterval(async () => {
+    if (await checkActive()) {
+      clearInterval(polling);
+      polling = null;
+      startPlayer();
+    }
+  }, 3000);
+}
+
+(async () => {
+  if (await checkActive()) {
+    startPlayer();
+  } else {
+    startPolling();
+  }
+})();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 @app.get("/", response_class=HTMLResponse)
 async def portal():
     return _PORTAL_HTML
+
+
+@app.get("/watch/{key}", response_class=HTMLResponse)
+async def watch_page(key: str):
+    """ストリームキーを知る視聴者向けプレイヤーページ。"""
+    if not _KEY_RE.match(key):
+        raise HTTPException(400, "無効なストリームキーです。")
+    return _WATCH_HTML.replace("__KEY_JSON__", json.dumps(key))
 
 
 # ─── 起動 ─────────────────────────────────────────────────────────────────────

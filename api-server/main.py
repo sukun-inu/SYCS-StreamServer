@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import socket
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -59,6 +60,19 @@ NO_CACHE_HEADERS = {
 
 _ngrok_cache:    dict[str, str] = {}
 _ngrok_cache_ts: float          = 0.0
+_local_ip:       str            = ""
+
+
+def _get_local_ip() -> str:
+    global _local_ip
+    if not _local_ip:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                _local_ip = s.getsockname()[0]
+        except Exception:
+            _local_ip = "サーバーIP"
+    return _local_ip
 
 
 async def get_ngrok_urls() -> dict[str, str]:
@@ -67,7 +81,11 @@ async def get_ngrok_urls() -> dict[str, str]:
     if now - _ngrok_cache_ts < _NGROK_TTL and _ngrok_cache:
         return _ngrok_cache
 
-    result: dict[str, str] = {"site": SITE_BASE_URL, "rtmp": ""}
+    result: dict[str, str] = {
+        "site":       SITE_BASE_URL,
+        "rtmp":       "",
+        "rtmp_local": f"rtmp://{_get_local_ip()}:1935/live",
+    }
     try:
         async with httpx.AsyncClient(timeout=3.0) as c:
             r = await c.get(f"{NGROK_RTMP_API}/api/tunnels")
@@ -106,9 +124,10 @@ async def _broadcast(msg: dict) -> None:
 async def _current_status() -> dict:
     urls = await get_ngrok_urls()
     return {
-        "rtmp":     urls.get("rtmp", ""),
-        "site":     urls.get("site", ""),
-        "sessions": {"active": len(_sessions), "max": MAX_SESSIONS},
+        "rtmp":       urls.get("rtmp", ""),
+        "rtmp_local": urls.get("rtmp_local", ""),
+        "site":       urls.get("site", ""),
+        "sessions":   {"active": len(_sessions), "max": MAX_SESSIONS},
     }
 
 
@@ -366,6 +385,12 @@ async def stream_info(key: str):
     }
 
 
+@app.get("/api/ngrok")
+async def ngrok_info():
+    """ngrok RTMP URL を返す REST エンドポイント (WebSocket フォールバック用)。"""
+    return await get_ngrok_urls()
+
+
 @app.get("/api/status")
 async def server_status():
     return {
@@ -497,6 +522,7 @@ input.empty{color:#484f58}
   <div class="card">
     <h2>OBS 配信設定</h2>
     <div class="alert" id="ngrok-alert">⚠ ngrok 無料プランでは再起動ごとに RTMP URL が変わります。</div>
+    <div class="alert" id="lan-alert" style="border-color:#1f6feb;color:#79c0ff;display:none">ℹ ngrok 未起動。LAN から直接接続する場合は下記 URL を使用してください。</div>
     <div class="row">
       <label>RTMP URL</label>
       <input id="u-rtmp" type="text" readonly class="empty" value="取得中...">
@@ -536,42 +562,86 @@ input.empty{color:#484f58}
 
 </main>
 <script>
-const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-let ws, reconnectTimer;
+// ─── 状態 ───────────────────────────────────────────────────────────────────
+let siteBase = '';
+let ws = null;
+let reconnectTimer = null;
+let pollTimer = null;
 
-function connectWS() {
-  ws = new WebSocket(`${wsProto}//${location.host}/ws`);
-  ws.onmessage = e => {
-    const d = JSON.parse(e.data);
-    if (d.ping) return;
-    if (d.rtmp) {
-      setVal('u-rtmp', d.rtmp, false);
-      document.getElementById('ngrok-alert').classList.add('show');
-    }
-    if (d.sessions) {
-      const s = d.sessions;
-      const pct = s.max > 0 ? s.active / s.max : 0;
-      const el = document.getElementById('cap');
-      el.textContent = `● ${s.active} / ${s.max}`;
-      el.style.color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
-    }
-  };
-  ws.onclose = () => { reconnectTimer = setTimeout(connectWS, 4000); };
-  ws.onerror = () => ws.close();
-}
-connectWS();
-
+// ─── UI ヘルパー ─────────────────────────────────────────────────────────────
 function setVal(id, val, empty) {
   const el = document.getElementById(id);
   if (!el) return;
   el.value = val;
-  el.classList.toggle('empty', empty || !val);
+  el.classList.toggle('empty', empty == null ? !val : empty);
 }
 
+function applyNgrokData(d) {
+  if (typeof d.site === 'string' && d.site) siteBase = d.site;
+  const hasNgrok = typeof d.rtmp === 'string' && d.rtmp !== '';
+  const displayUrl = hasNgrok ? d.rtmp : (d.rtmp_local || '');
+  if (displayUrl) setVal('u-rtmp', displayUrl, !hasNgrok);
+  document.getElementById('ngrok-alert').classList.toggle('show', hasNgrok);
+  const lanEl = document.getElementById('lan-alert');
+  lanEl.style.display = !hasNgrok && displayUrl ? 'block' : 'none';
+}
+
+function applyCapacity(active, max) {
+  const pct = max > 0 ? active / max : 0;
+  const el = document.getElementById('cap');
+  el.textContent = `● ${active} / ${max}`;
+  el.style.color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
+}
+
+// ─── REST フォールバック ─────────────────────────────────────────────────────
+async function fetchFromRest() {
+  try {
+    const r = await fetch('/api/ngrok');
+    if (r.ok) applyNgrokData(await r.json());
+  } catch {}
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) { const s = await r.json(); applyCapacity(s.active, s.max); }
+  } catch {}
+}
+
+// ─── WebSocket ───────────────────────────────────────────────────────────────
+function connectWS() {
+  clearTimeout(reconnectTimer);
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  };
+
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.ping) return;
+    if ('rtmp' in d || 'site' in d) applyNgrokData(d);
+    if (d.sessions) applyCapacity(d.sessions.active, d.sessions.max);
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    if (!pollTimer) pollTimer = setInterval(fetchFromRest, 10000);
+    reconnectTimer = setTimeout(connectWS, 5000);
+  };
+
+  ws.onerror = () => ws && ws.close();
+}
+
+// ─── 初期化 ─────────────────────────────────────────────────────────────────
+// ページ読み込み直後に REST で即座取得し、WebSocket も並行接続
+fetchFromRest();
+connectWS();
+
+// ─── コピー / 開く ───────────────────────────────────────────────────────────
 function cp(id, btn) {
-  const v = document.getElementById(id)?.value;
-  if (!v || document.getElementById(id).classList.contains('empty')) return;
-  navigator.clipboard.writeText(v).then(() => {
+  const el = document.getElementById(id);
+  if (!el || el.classList.contains('empty')) return;
+  navigator.clipboard.writeText(el.value).then(() => {
     const orig = btn.textContent;
     btn.textContent = '✓'; btn.classList.add('ok');
     setTimeout(() => { btn.textContent = orig; btn.classList.remove('ok'); }, 2000);
@@ -579,37 +649,32 @@ function cp(id, btn) {
 }
 
 function openWatch() {
-  const v = document.getElementById('u-watch')?.value;
-  if (v && !document.getElementById('u-watch').classList.contains('empty')) window.open(v, '_blank');
+  const el = document.getElementById('u-watch');
+  if (el && !el.classList.contains('empty')) window.open(el.value, '_blank');
 }
 
+// ─── ストリーム確認 ──────────────────────────────────────────────────────────
 async function checkStream() {
   const key = document.getElementById('key-input').value.trim();
   if (!key) return;
-  const res = document.getElementById('stream-result');
-  res.style.display = 'block';
+  document.getElementById('stream-result').style.display = 'block';
 
   try {
     const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
     if (!r.ok) { showStatus(false, '無効なキーです'); return; }
     const d = await r.json();
-    const extBase = (typeof _siteBase !== 'undefined' && _siteBase) ? _siteBase : location.origin;
-    const hlsUrl  = `${extBase}${d.hls_url}`;
-    const watchUrl = `${extBase}/watch/${encodeURIComponent(key)}`;
-
+    const base = siteBase || location.origin;
     showStatus(d.active, d.active ? 'LIVE' : '待機中');
-    setVal('u-vrc',   hlsUrl,   false);
-    setVal('u-watch', watchUrl, false);
+    setVal('u-vrc',   `${base}${d.hls_url}`, false);
+    setVal('u-watch', `${base}/watch/${encodeURIComponent(key)}`, false);
   } catch {
     showStatus(false, '取得失敗');
   }
 }
 
 function showStatus(live, label) {
-  const dot = document.getElementById('s-dot');
-  const lbl = document.getElementById('s-label');
-  dot.className = 'status-dot ' + (live ? 'live' : 'off');
-  lbl.textContent = label;
+  document.getElementById('s-dot').className = 'status-dot ' + (live ? 'live' : 'off');
+  document.getElementById('s-label').textContent = label;
 }
 
 document.getElementById('key-input').addEventListener('keydown', e => {

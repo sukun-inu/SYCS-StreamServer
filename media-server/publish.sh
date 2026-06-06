@@ -2,7 +2,7 @@
 # mediamtx の runOnReady フックから呼び出される。
 # 環境変数 MTX_PATH="live/..." でストリームパスを受け取る。
 
-STREAM_NAME="${MTX_PATH%%/*}"
+STREAM_NAME="${MTX_PATH##*/}"
 if [ -z "${STREAM_NAME}" ]; then
     echo "$(date -u +%FT%TZ) [publish-error] MTX_PATH が未設定または不正: MTX_PATH='${MTX_PATH}'" >&2
     exit 1
@@ -21,7 +21,7 @@ HLS_SEGMENT_TIME="${HLS_SEGMENT_TIME:-0.5}"
 HLS_PART_DURATION="${HLS_PART_DURATION:-0.1}"
 HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 
-OUTPUT_DIR="/hls/${STREAM_NAME}"
+OUTPUT_DIR="/hls/live/${STREAM_NAME}"
 mkdir -p "${OUTPUT_DIR}/high" "${OUTPUT_DIR}/low"
 
 FFMPEG_EXIT=0
@@ -78,6 +78,7 @@ ffmpeg \
     -hls_flags delete_segments+split_by_time+temp_file+program_date_time \
     -hls_segment_type fmp4 \
     -hls_fmp4_init_filename "init_%v.mp4" \
+    -hls_part_duration "${HLS_PART_DURATION}" \
     -hls_segment_filename "${OUTPUT_DIR}/%v/seg%05d.m4s" \
     -master_pl_name master.m3u8 \
     -var_stream_map "v:0,a:0,name:high v:1,a:1,name:low" \

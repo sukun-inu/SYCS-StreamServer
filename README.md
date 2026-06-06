@@ -1,7 +1,7 @@
 # SYCS Stream Server
 
 OBS → LL-HLS → VRChat 向け超低遅延ライブ配信基盤。  
-GTX1650 の NVENC を活用し、ngrok 経由で HTTPS 公開する Docker Compose スタック。  
+GTX1650 の NVENC を活用し、ngrok + Cloudflare Tunnel で HTTPS 公開する Docker Compose スタック。  
 **設定ファイル不要** — すべての設定は環境変数 (`.env` または Portainer) で管理します。
 
 ---
@@ -13,16 +13,16 @@ OBS Studio
     │ RTMP (port 1935)
     ▼
 ┌──────────────────────────────────────────────┐
-│ media-server (nginx-rtmp + FFmpeg NVENC)     │
-│  RTMP 受信 → h264_nvenc エンコード           │
-│  ├─ pc/      LL-HLS fmp4  (超低遅延)         │
-│  └─ android/ 標準 HLS TS  (最大互換)         │
+│ media-server (mediamtx + FFmpeg NVENC)       │
+│  RTMP 受信 → h264_nvenc ABR VBR エンコード   │
+│  → fmp4 LL-HLS (high/low 2バリアント)        │
 └──────────────────┬───────────────────────────┘
                    │ Docker Volume (hls-data)
                    ▼
 ┌──────────────────────────────────────────────┐
 │ api-server (Python / FastAPI :8080)          │
-│  HLS 配信 / ポータルサイト / ngrok RTMP 表示 │
+│  HLS 配信 / ポータルサイト / セッション管理  │
+│  ngrok RTMP URL リアルタイム配信 (WebSocket) │
 └──────────────────┬───────────────────────────┘
                    │ HTTP (localhost:8080)
                    ▼
@@ -34,12 +34,12 @@ OBS Studio
 
 ┌──────────────────────────────────────────────┐
 │ ngrok-rtmp (TCP トンネル、LAN 外配信時)      │
-│  localhost:1935 → rtmp://x.tcp.ngrok.io:PORT │
+│  127.0.0.1:1935 → rtmp://x.tcp.ngrok.io:PORT │
 └──────────────────────────────────────────────┘
 ```
 
 **ネットワークモード:** 全コンテナが `network_mode: host` を使用。  
-コンテナ間通信はコンテナ名 DNS の代わりに `localhost` を使用します。
+コンテナ間通信は `localhost` / `127.0.0.1` で行います。
 
 **期待遅延:**
 
@@ -47,7 +47,7 @@ OBS Studio
 |------|------|
 | ローカルネットワーク視聴 | ~0.5s |
 | Cloudflare 経由 (PC LL-HLS) | ~1〜1.5s |
-| Cloudflare 経由 (Android HLS) | ~1.5〜3s |
+| Cloudflare 経由 (Android) | ~1〜2s |
 
 ---
 
@@ -56,11 +56,11 @@ OBS Studio
 | 項目 | 要件 |
 |------|------|
 | OS | Ubuntu 22.04 LTS (KVM/QEMU 仮想化可) |
-| GPU | GTX1650 以上 (NVENC 対応) |
+| GPU | GTX1650 以上 (NVENC 対応)、なければ libx264 自動フォールバック |
 | RAM | 4GB 以上 |
 | Docker | 20.10 以上 + NVIDIA Container Toolkit 設定済み |
 | Docker Compose | v2.x 以上 |
-| ngrok | アカウント登録済み (無料プラン可) |
+| ngrok | アカウント登録済み (無料プラン可、LAN 内配信のみなら不要) |
 
 ---
 
@@ -69,7 +69,7 @@ OBS Studio
 ### 1. リポジトリ取得
 
 ```bash
-git clone https://github.com/YOUR_USER/SYCS-StreamServer.git
+git clone https://github.com/sukun-inu/SYCS-StreamServer.git
 cd SYCS-StreamServer
 ```
 
@@ -78,7 +78,7 @@ cd SYCS-StreamServer
 ```bash
 cp .env.example .env
 nano .env
-# NGROK_AUTHTOKEN=xxx          を必ず設定
+# NGROK_AUTHTOKEN=xxx          を必ず設定 (LAN 外配信時)
 # SITE_BASE_URL=https://...    Cloudflare Tunnel の公開ドメインを設定
 ```
 
@@ -95,7 +95,7 @@ docker compose logs -f
 ### 4. ポータル確認
 
 ブラウザで `http://サーバーIP:8080` を開くと  
-ngrok の公開 URL・VRChat URL・RTMP アドレスが表示されます。
+ngrok の RTMP URL・VRChat URL が表示されます。
 
 ---
 
@@ -104,32 +104,42 @@ ngrok の公開 URL・VRChat URL・RTMP アドレスが表示されます。
 | 項目 | 値 |
 |------|-----|
 | 設定 → 配信 → サービス | **カスタム...** |
-| サーバー | ポータルの「RTMP(OBS 配信先)」欄の URL |
-| ストリームキー | 任意 (例: `stream`) |
+| サーバー | ポータルの「RTMP URL」欄の URL (例: `rtmp://0.tcp.jp.ngrok.io:XXXXX/live`) |
+| ストリームキー | **任意** (何を入力しても動作します) |
 
-**推奨エンコード設定:**
+> ngrok が起動していない場合はポータルにローカル IP の RTMP URL が表示されます。  
+> LAN 内から配信する場合は `ngrok-rtmp` サービスを docker-compose.yml でコメントアウトできます。
+
+**推奨 OBS エンコード設定:**
 
 | 項目 | 推奨値 |
 |------|--------|
 | エンコーダ | NVENC H.264 (または x264) |
-| レート制御 | CBR |
+| レート制御 | VBR または CBR |
 | ビットレート | 3000〜6000 Kbps |
 | キーフレーム間隔 | 1秒 固定 |
 
 ---
 
+## ポータルの使い方
+
+`http://サーバーIP:8080` にアクセスすると OBS 配信設定と視聴 URL 生成ページが開きます。
+
+1. **OBS 配信設定** — RTMP URL が自動表示される。ngrok 起動中は ngrok URL、未起動時は LAN IP を表示。
+2. **視聴 URL 生成** — ストリームキー欄に `live` と入力して「確認」を押す。
+3. **VRChat URL** が生成されるのでコピーして VRChat のビデオプレイヤーに貼り付ける。
+
+---
+
 ## VRChat での視聴
 
-ポータルサイトの接続情報から URL をコピーして使います。
+| プラットフォーム | URL | 遅延 |
+|----------------|-----|------|
+| **VRChat PC** | ポータルの「VRChat URL」欄 | ~0.5〜1s |
+| **VRChat Android** | 同じ URL (LL-HLS フォールバック) | ~1〜2s |
 
-| プラットフォーム | 使う URL | 遅延 |
-|----------------|---------|------|
-| **VRChat PC** | 「VRChat URL」欄 (`/master.m3u8`) | ~0.5〜1s |
-| **VRChat Android** | 同じ URL (LL-HLS フォールバック) | ~1〜1.5s |
-
-> PC / Android ともにポータルの「VRChat URL」欄の **同一 URL** を使います。  
-> fmp4 LL-HLS は後方互換設計なので、LL-HLS 非対応の Android AVPro でも  
-> セグメント単位で再生できます。
+> PC / Android ともに同一 URL を使います。  
+> fmp4 LL-HLS は後方互換設計なので、LL-HLS 非対応の Android AVPro でも再生できます。
 
 ---
 
@@ -139,7 +149,7 @@ Portainer の **Stacks → Add stack → Repository** から:
 
 | 項目 | 値 |
 |------|-----|
-| Repository URL | `https://github.com/YOUR_USER/SYCS-StreamServer` |
+| Repository URL | `https://github.com/sukun-inu/SYCS-StreamServer` |
 | Branch | `main` |
 | Compose path | `docker-compose.yml` |
 | Environment variables | `.env.example` の内容を各行貼り付け、値を埋める |
@@ -158,37 +168,48 @@ Portainer の **Stacks → Add stack → Repository** から:
 | `SITE_BASE_URL` | *(空文字)* | Cloudflare Tunnel の公開ドメイン (例: `https://stream.example.com`) |
 
 > Cloudflare Tunnel のコンテナは **別スタック** で管理します。  
-> このリポジトリには含まれません。Cloudflare Zero Trust ダッシュボードで  
-> トンネルを作成し、`localhost:8080` を公開してください。
+> Cloudflare Zero Trust ダッシュボードでトンネルを作成し、`localhost:8080` を公開してください。
 
 ### ngrok (RTMP 公開)
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `NGROK_AUTHTOKEN` | *(必須)* | ngrok 認証トークン |
-| `NGROK_RTMP_TARGET` | `localhost:1935` | RTMP トンネル向き先 |
-| `NGROK_RTMP_API` | `http://localhost:4040` | FastAPI が参照する ngrok API URL |
+| `NGROK_RTMP_TARGET` | `127.0.0.1:1935` | RTMP トンネル向き先 |
+| `NGROK_RTMP_API` | `http://127.0.0.1:4040` | api-server が参照する ngrok API URL |
 | `NGROK_CACHE_TTL` | `30` | ngrok URL キャッシュ秒数 |
 
 ### エンコード / HLS
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
-| `RTMP_PORT` | `1935` | RTMP 受信ポート |
-| `VIDEO_BITRATE` | `6000k` | high レンダリング映像平均ビットレート (maxrate は自動で 1.35 倍) |
-| `VIDEO_BITRATE_LOW` | `2000k` | low レンダリング映像平均ビットレート (720p) |
-| `AUDIO_BITRATE` | `320k` | high レンダリング音声上限 (low は 128k 固定) |
+| `VIDEO_BITRATE` | `6000k` | high バリアント映像平均ビットレート (maxrate 自動 1.35 倍) |
+| `VIDEO_BITRATE_LOW` | `2000k` | low バリアント映像平均ビットレート (720p) |
+| `AUDIO_BITRATE` | `320k` | high バリアント音声上限 (low は 128k 固定) |
 | `HLS_SEGMENT_TIME` | `0.5` | セグメント長 (秒) |
 | `HLS_PART_DURATION` | `0.1` | LL-HLS パーツ長 (秒) |
-| `HLS_LIST_SIZE` | `6` | プレイリスト保持数 |
+| `HLS_LIST_SIZE` | `6` | プレイリスト保持セグメント数 |
+
+### セッション管理
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `MAX_SESSIONS` | `100` | 同時視聴上限 (超過新規接続はキュー待機) |
+| `SESSION_TIMEOUT` | `8.0` | 最終リクエストからのセッション消滅秒数 |
+| `QUEUE_TIMEOUT` | `20.0` | キュー待機タイムアウト秒数 (超過で 503) |
+| `MAX_BPS` | `1375000` | セッションあたり最大受信バイト/秒 (超過で 429) |
+
+### API / ログ
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
 | `API_PORT` | `8080` | ポータルサイト公開ポート |
-| `LOG_LEVEL` | `info` | ログレベル |
+| `LOG_LEVEL` | `info` | ログレベル (debug / info / warning / error) |
 
 ### Docker / インフラ
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
-| `CUDA_VERSION` | `12.3.1-runtime-ubuntu22.04` | ベースイメージの CUDA バージョン |
 | `GPU_COUNT` | `1` | 割り当て GPU 数 |
 | `RESTART_POLICY` | `unless-stopped` | コンテナ再起動ポリシー |
 | `HC_INTERVAL` | `10s` | ヘルスチェック間隔 |
@@ -204,22 +225,20 @@ Portainer の **Stacks → Add stack → Repository** から:
 
 ```
 SYCS-StreamServer/
-├── docker-compose.yml        ← 全サービス定義 (設定ファイル不要)
+├── docker-compose.yml        ← 全サービス定義
 ├── .env.example              ← コピーして .env を作成
 ├── .gitignore
 ├── README.md
 ├── SPEC.md
 ├── media-server/
-│   ├── Dockerfile            ← nvidia/cuda ベース + nginx-rtmp + FFmpeg
-│   ├── nginx.conf            ← RTMP 受信 (on_publish → publish.sh)
-│   ├── publish.sh            ← PC/Android 2系統 HLS 生成
+│   ├── Dockerfile            ← nvidia/cuda ベース (マルチステージ: mediamtx + FFmpeg)
+│   ├── mediamtx.yml          ← RTMP 受信設定 (runOnPublish → publish.sh)
+│   ├── publish.sh            ← FFmpeg ABR VBR LL-HLS 生成スクリプト
 │   └── entrypoint.sh
-├── api-server/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── main.py               ← FastAPI ポータル + HLS 配信 + ngrok 取得
-└── ngrok/
-    └── ngrok.yml.example     ← 参照用 (現在は使用しない)
+└── api-server/
+    ├── Dockerfile
+    ├── requirements.txt
+    └── main.py               ← FastAPI ポータル + HLS 配信 + WebSocket
 ```
 
 ---
@@ -229,32 +248,42 @@ SYCS-StreamServer/
 ### ngrok RTMP URL が表示されない
 
 ```bash
-# ngrok-rtmp コンテナのログを確認
 docker compose logs ngrok-rtmp
-
-# よくある原因:
-# - NGROK_AUTHTOKEN が未設定または誤り
-# - ngrok アカウントのトンネル上限に達している (無料: TCP 1トンネル/アカウント)
 ```
 
-> **無料プランの注意:** ngrok 無料プランは TCP トンネル 1 本まで。  
-> LAN 内から OBS 配信する場合は `ngrok-rtmp` サービスをコメントアウトできます。
+よくある原因:
+- `NGROK_AUTHTOKEN` が未設定または誤り
+- ngrok アカウントのトンネル上限 (無料: TCP 1 トンネル/アカウント)
 
-### Cloudflare Tunnel 経由でアクセスできない
+> LAN 内から配信する場合は `ngrok-rtmp` サービスをコメントアウトできます。  
+> ポータルに自動でローカル IP ベースの RTMP URL が表示されます。
 
-このリポジトリは Cloudflare Tunnel のコンテナを含みません。  
-別スタックで `cloudflared` を起動し、`localhost:8080` をトンネル経由で公開してください。  
-公開ドメインを `SITE_BASE_URL` に設定するとポータルの URL 表示に反映されます。
+### OBS が接続できない (LAN 外配信)
+
+```bash
+docker compose logs ngrok-rtmp | grep "url="
+```
+
+表示された `rtmp://x.tcp.ngrok.io:PORT/live` を OBS のサーバーに設定してください。
+
+### HLS 出力が生成されない / ストリームが映らない
+
+```bash
+# publish.sh のログを確認 (ストリーム開始後に生成される)
+docker exec sycs-media-server cat /tmp/publish_live.log
+
+# mediamtx のログを確認
+docker compose logs media-server
+```
 
 ### GPU が認識されない
 
 ```bash
 docker exec sycs-media-server nvidia-smi
-# または
-docker compose logs media-server | grep -E "NVENC|GPU"
+docker compose logs media-server | grep -E "NVENC|GPU|nvenc"
 ```
 
-`libx264` フォールバックのログが出る場合は NVIDIA Container Toolkit を確認:
+`h264_nvenc 不可 → libx264` のログが出る場合は NVIDIA Container Toolkit を確認:
 ```bash
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
@@ -263,13 +292,11 @@ sudo systemctl restart docker
 ### 遅延が大きい / 遅延が増え続ける
 
 1. `.env` で `HLS_SEGMENT_TIME=0.5`・`HLS_PART_DURATION=0.1` になっているか確認
-2. ブラウザで `http://サーバーIP:8080/hls/live/{key}/pc/index.m3u8` を開き  
-   `EXT-X-PROGRAM-DATE-TIME` タグが含まれているか確認
-3. OBS のキーフレーム間隔を 1 秒に設定する
+2. OBS のキーフレーム間隔を 1 秒に設定する
+3. ブラウザで `/hls/live/high/index.m3u8` を開き `EXT-X-PROGRAM-DATE-TIME` タグがあるか確認
 
-### OBS が接続できない (LAN 外配信)
+### Cloudflare Tunnel 経由でアクセスできない
 
-```bash
-docker compose logs ngrok-rtmp | grep "url="
-# 表示された rtmp://x.tcp.ngrok.io:PORT/live を OBS の配信先に設定
-```
+このリポジトリは Cloudflare Tunnel のコンテナを含みません。  
+別スタックで `cloudflared` を起動し、`localhost:8080` をトンネル経由で公開してください。  
+公開ドメインを `SITE_BASE_URL` に設定するとポータルの URL 表示に反映されます。

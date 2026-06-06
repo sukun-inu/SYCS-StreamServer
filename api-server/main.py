@@ -663,7 +663,7 @@ async function checkStream() {
     const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
     if (!r.ok) { showStatus(false, '無効なキーです'); return; }
     const d = await r.json();
-    const base = siteBase || location.origin;
+    const base = (siteBase || location.origin).replace(/\/$/, '');
     showStatus(d.active, d.active ? 'LIVE' : '待機中');
     setVal('u-vrc',   `${base}${d.hls_url}`, false);
     setVal('u-watch', `${base}/watch/${encodeURIComponent(key)}`, false);

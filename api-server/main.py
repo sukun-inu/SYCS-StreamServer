@@ -376,12 +376,12 @@ async def stream_info(key: str):
     """指定キーのストリーム状態を返す。配信一覧は公開しない。"""
     if not _KEY_RE.match(key):
         raise HTTPException(400, "無効なストリームキーです。")
-    stream_dir = HLS_DIR / "live" / key
+    stream_dir = HLS_DIR / key
     active = (stream_dir / "high" / "index.m3u8").exists()
     return {
         "key":     key,
         "active":  active,
-        "hls_url": f"/hls/live/{key}/master.m3u8",
+        "hls_url": f"/hls/{key}/master.m3u8",
     }
 
 
@@ -708,7 +708,7 @@ video{width:100%;height:100%;object-fit:contain}
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 const KEY = __KEY_JSON__;
-const HLS_URL = `/hls/live/${KEY}/master.m3u8`;
+const HLS_URL = `/hls/${KEY}/master.m3u8`;
 let hls = null;
 let polling = null;
 

@@ -2,7 +2,7 @@
 # mediamtx が環境変数 MTX_PATH="live/kawasaki" を渡す。
 # argv 渡しに依存しないため nginx-rtmp の exec_push 問題は発生しない。
 
-STREAM_NAME="${MTX_PATH##*/}"
+STREAM_NAME="${MTX_PATH%%/*}"
 if [ -z "${STREAM_NAME}" ]; then
     echo "$(date -u +%FT%TZ) [publish-error] MTX_PATH が未設定または不正: MTX_PATH='${MTX_PATH}'" >&2
     exit 1
@@ -21,7 +21,7 @@ HLS_SEGMENT_TIME="${HLS_SEGMENT_TIME:-0.5}"
 HLS_PART_DURATION="${HLS_PART_DURATION:-0.1}"
 HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 
-OUTPUT_DIR="/hls/live/${STREAM_NAME}"
+OUTPUT_DIR="/hls/${STREAM_NAME}"
 mkdir -p "${OUTPUT_DIR}/high" "${OUTPUT_DIR}/low"
 
 cleanup() {

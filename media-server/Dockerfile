@@ -1,3 +1,7 @@
+# FROM 命令で使う ARG は全 FROM より前に宣言する必要がある
+ARG CUDA_VERSION=12.6.3-runtime-ubuntu24.04
+ARG FFMPEG_VERSION=7.1.1
+
 # ── Stage 1: mediamtx バイナリ取得 ───────────────────────────────────────────
 FROM bluenviron/mediamtx:latest AS mediamtx
 
@@ -5,7 +9,7 @@ FROM bluenviron/mediamtx:latest AS mediamtx
 # Ubuntu パッケージ版 FFmpeg 6.1.1 は hls_part_duration 未対応のため自前ビルド
 FROM ubuntu:24.04 AS ffmpeg-builder
 ARG DEBIAN_FRONTEND=noninteractive
-ARG FFMPEG_VERSION=7.1.1
+ARG FFMPEG_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git build-essential pkg-config nasm yasm wget ca-certificates \
@@ -40,7 +44,6 @@ RUN wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.bz2" -O /t
     && rm -rf /tmp/ffmpeg*
 
 # ── Stage 3: 実行イメージ ─────────────────────────────────────────────────────
-ARG CUDA_VERSION=12.6.3-runtime-ubuntu24.04
 FROM nvidia/cuda:${CUDA_VERSION}
 ARG DEBIAN_FRONTEND=noninteractive
 

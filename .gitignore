@@ -5,6 +5,9 @@
 cloudflared/*.json
 cloudflared/config.yml
 
+# ngrok 設定 (authtoken を含む)
+ngrok/ngrok.yml
+
 # HLS 出力 (実行時生成ファイル)
 hls/
 

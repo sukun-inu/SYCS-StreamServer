@@ -50,12 +50,16 @@ services:
       retries: 3
       start_period: 5s
 
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: sycs-cloudflared
-    command: tunnel --config /etc/cloudflared/config.yml run
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: sycs-ngrok
+    command: start --all --config /etc/ngrok/ngrok.yml
     volumes:
-      - ./cloudflared:/etc/cloudflared:ro
+      - ./ngrok/ngrok.yml:/etc/ngrok/ngrok.yml:ro
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    ports:
+      - "4040:4040"   # ngrok Web UI (管理用)
     restart: unless-stopped
     depends_on:
       api-server:

@@ -1,0 +1,21 @@
+# ngrok マルチトンネル設定テンプレート
+# 1. https://dashboard.ngrok.com で authtoken を取得
+# 2. このファイルを ngrok.yml にリネーム
+# 3. .env に NGROK_AUTHTOKEN=xxx を設定
+#
+# ★ TCP トンネル (rtmp) は ngrok の全プランで使用可能
+#    ただし URL はリスタートごとに変わる (有料プランで固定 URL 取得可)
+
+version: "2"
+
+tunnels:
+  # HLS 配信 / ポータルサイト (HTTPS)
+  hls:
+    addr: sycs-api-server:8080
+    proto: http
+    inspect: false
+
+  # RTMP ingest (OBS → サーバー、LAN 外から配信する場合)
+  rtmp:
+    addr: sycs-media-server:1935
+    proto: tcp

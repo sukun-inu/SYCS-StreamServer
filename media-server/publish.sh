@@ -1,8 +1,13 @@
 #!/bin/bash
-# nginx-rtmp の exec_push から呼ばれる。$1 = ストリームキー
 set -e
 
 STREAM_NAME="${1:?stream name required}"
+
+# exec_push は stdout/stderr を閉じるためファイルに出力する
+LOG="/tmp/publish_${STREAM_NAME}.log"
+exec >>"${LOG}" 2>&1
+echo "[publish:$$] $(date -u +%FT%TZ) start key=${STREAM_NAME}"
+
 VIDEO_BITRATE="${VIDEO_BITRATE:-6000k}"
 VIDEO_BITRATE_LOW="${VIDEO_BITRATE_LOW:-2000k}"
 AUDIO_BITRATE="${AUDIO_BITRATE:-320k}"
@@ -53,7 +58,7 @@ ffmpeg \
     -loglevel warning \
     -fflags +genpts \
     -use_wallclock_as_timestamps 1 \
-    -i "rtmp://localhost:1935/live/${STREAM_NAME}" \
+    -i "rtmp://127.0.0.1:1935/live/${STREAM_NAME}" \
     -filter_complex "[0:v]split=2[vh][vl];[vl]scale=-2:720[vls]" \
     -map "[vh]"  -map 0:a \
     -map "[vls]" -map 0:a \

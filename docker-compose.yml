@@ -34,7 +34,7 @@ services:
               capabilities: [gpu]
     restart: ${RESTART_POLICY:-unless-stopped}
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "1935"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "1935"]
       interval: ${HC_INTERVAL:-10s}
       timeout: ${HC_TIMEOUT:-5s}
       retries: ${HC_RETRIES:-5}
@@ -52,7 +52,7 @@ services:
     environment:
       - HLS_DIR=/hls
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      - NGROK_RTMP_API=${NGROK_RTMP_API:-http://localhost:4040}
+      - NGROK_RTMP_API=${NGROK_RTMP_API:-http://127.0.0.1:4040}
       - NGROK_CACHE_TTL=${NGROK_CACHE_TTL:-30}
       - SITE_BASE_URL=${SITE_BASE_URL:-}
       - MAX_SESSIONS=${MAX_SESSIONS:-100}
@@ -77,7 +77,7 @@ services:
     image: ngrok/ngrok:latest
     container_name: ${NGROK_RTMP_CONTAINER:-sycs-ngrok-rtmp}
     network_mode: host
-    command: tcp --log=stdout ${NGROK_RTMP_TARGET:-localhost:1935}
+    command: tcp --log=stdout ${NGROK_RTMP_TARGET:-127.0.0.1:1935}
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     restart: ${RESTART_POLICY:-unless-stopped}

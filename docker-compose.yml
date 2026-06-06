@@ -11,13 +11,9 @@ version: "3.8"
 services:
 
   # ── RTMP 受信 + FFmpeg NVENC エンコード + LL-HLS 生成 ──────────────────────
+  # イメージは GitHub Actions で ghcr.io にビルド済み。ローカルビルド不要。
   media-server:
-    build:
-      context: ./media-server
-      args:
-        CUDA_VERSION: ${CUDA_VERSION:-12.3.1-runtime-ubuntu22.04}
-    image: sycs-media-server:latest
-    pull_policy: build
+    image: ghcr.io/${GHCR_OWNER}/sycs-media-server:latest
     container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     network_mode: host
     volumes:
@@ -48,9 +44,7 @@ services:
   # サイト外部公開は別スタックの Cloudflare Tunnel が担う
   # SITE_BASE_URL に Cloudflare の公開ドメインを設定するとポータルの URL 表示に反映される
   api-server:
-    build: ./api-server
-    image: sycs-api-server:latest
-    pull_policy: build
+    image: ghcr.io/${GHCR_OWNER}/sycs-api-server:latest
     container_name: ${API_CONTAINER:-sycs-api-server}
     network_mode: host
     volumes:

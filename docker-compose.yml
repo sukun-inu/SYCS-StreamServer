@@ -5,9 +5,8 @@ version: "3.8"
 #  すべての設定値は .env (または Portainer の Environment 欄) で上書き可能
 #  ネットワークモード: host (全コンテナがホスト NW を共有)
 #
-#  起動:           docker compose up -d --build
-#  イメージ再ビルド: docker compose build --no-cache [service]
-#  ログ確認:        docker compose logs -f [service]
+#  Portainer 運用: image: ghcr.io/... を pull して起動
+#  ローカル開発:   docker compose build --no-cache && docker compose up -d
 # ============================================================
 
 services:
@@ -17,6 +16,7 @@ services:
     build:
       context: ./media-server
       dockerfile: Dockerfile
+    image: ghcr.io/sukun-inu/sycs-media-server:latest
     container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     network_mode: host
     volumes:
@@ -49,6 +49,7 @@ services:
     build:
       context: ./api-server
       dockerfile: Dockerfile
+    image: ghcr.io/sukun-inu/sycs-api-server:latest
     container_name: ${API_CONTAINER:-sycs-api-server}
     network_mode: host
     volumes:

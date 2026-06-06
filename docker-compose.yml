@@ -38,7 +38,7 @@ services:
       interval: ${HC_INTERVAL:-10s}
       timeout: ${HC_TIMEOUT:-5s}
       retries: ${HC_RETRIES:-5}
-      start_period: 10s
+      start_period: 30s
 
   # ── HLS HTTP 配信 + ポータルサイト ──────────────────────────────────────────
   # サイト外部公開は別スタックの Cloudflare Tunnel が担う

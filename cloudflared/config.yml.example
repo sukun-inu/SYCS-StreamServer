@@ -1,0 +1,24 @@
+# Cloudflare Tunnel 設定テンプレート
+# 1. `cloudflared tunnel create sycs-stream` を実行し Tunnel ID を取得
+# 2. このファイルを config.yml にリネームし YOUR_TUNNEL_ID を置換
+# 3. 生成された <TUNNEL_ID>.json をこのディレクトリに配置
+# 4. Cloudflare DNS で CNAME: stream.example.com → <TUNNEL_ID>.cfargotunnel.com
+
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /etc/cloudflared/YOUR_TUNNEL_ID.json
+
+ingress:
+  # HLS 配信エンドポイント
+  - hostname: stream.example.com
+    service: http://sycs-api-server:8080
+    originRequest:
+      # 大きな動画セグメントのタイムアウト対策
+      connectTimeout: 30s
+      tcpKeepAlive: 30s
+      keepAliveConnections: 100
+      keepAliveTimeout: 90s
+      # LL-HLS ブロッキングリクエストのタイムアウト対策
+      originServerName: stream.example.com
+
+  # デフォルト (一致しないホスト)
+  - service: http_status:404

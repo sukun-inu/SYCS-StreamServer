@@ -1,0 +1,21 @@
+# 環境変数 (秘密情報)
+.env
+
+# Cloudflare Tunnel 認証情報
+cloudflared/*.json
+cloudflared/config.yml
+
+# HLS 出力 (実行時生成ファイル)
+hls/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Docker
+.docker/

@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  media-server:
+    build: ./media-server
+    container_name: sycs-media-server
+    ports:
+      - "${RTMP_PORT:-1935}:1935"
+    volumes:
+      - hls-data:/hls
+    environment:
+      - VIDEO_BITRATE=${VIDEO_BITRATE:-4000k}
+      - AUDIO_BITRATE=${AUDIO_BITRATE:-128k}
+      - HLS_SEGMENT_TIME=${HLS_SEGMENT_TIME:-0.5}
+      - HLS_PART_DURATION=${HLS_PART_DURATION:-0.1}
+      - HLS_LIST_SIZE=${HLS_LIST_SIZE:-6}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "1935"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  api-server:
+    build: ./api-server
+    container_name: sycs-api-server
+    ports:
+      - "${API_PORT:-8080}:8080"
+    volumes:
+      - hls-data:/hls:ro
+    environment:
+      - HLS_DIR=/hls
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    restart: unless-stopped
+    depends_on:
+      media-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: sycs-cloudflared
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    restart: unless-stopped
+    depends_on:
+      api-server:
+        condition: service_healthy
+
+volumes:
+  hls-data:
+    driver: local

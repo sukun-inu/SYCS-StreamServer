@@ -31,7 +31,11 @@ import uvicorn
 
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
-HLS_DIR = Path(os.environ.get("HLS_DIR", "/hls"))
+HLS_DIR        = Path(os.environ.get("HLS_DIR", "/hls"))
+# ngrok コンテナが別名の場合は env で変更可
+NGROK_HLS_API  = os.environ.get("NGROK_HLS_API",  "http://ngrok-hls:4040")
+NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://ngrok-rtmp:4040")
+_NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
 
 MEDIA_TYPES: dict[str, str] = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -49,39 +53,51 @@ NO_CACHE_HEADERS = {
 }
 
 # ─── ngrok URL キャッシュ ─────────────────────────────────────────────────────
+#
+# ngrok-hls / ngrok-rtmp はそれぞれ独立したコンテナで動作し、
+# 各コンテナの :4040 に API が立つ。設定ファイル不要、env のみで制御する。
 
 _ngrok_cache: dict[str, str] = {}
 _ngrok_cache_ts: float = 0.0
-_NGROK_TTL = 30.0  # 秒
 
 
 async def get_ngrok_urls() -> dict[str, str]:
     global _ngrok_cache, _ngrok_cache_ts
-    loop = asyncio.get_event_loop()
-    now = loop.time()
+    now = asyncio.get_event_loop().time()
     if now - _ngrok_cache_ts < _NGROK_TTL and _ngrok_cache:
         return _ngrok_cache
 
+    async def _fetch_tunnels(api_url: str) -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as c:
+                r = await c.get(f"{api_url}/api/tunnels")
+                return r.json().get("tunnels", [])
+        except Exception:
+            return []
+
+    # 2コンテナを並行取得
+    hls_tunnels, rtmp_tunnels = await asyncio.gather(
+        _fetch_tunnels(NGROK_HLS_API),
+        _fetch_tunnels(NGROK_RTMP_API),
+    )
+
     result: dict[str, str] = {"hls": "", "rtmp": ""}
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as c:
-            r = await c.get("http://ngrok:4040/api/tunnels")
-            tunnels: list[dict] = r.json().get("tunnels", [])
 
-        for t in tunnels:
-            name = t.get("name", "")
-            pub: str = t.get("public_url", "")
-            if name == "hls" and pub.startswith("https://"):
-                result["hls"] = pub
-            elif name == "rtmp" and pub.startswith("tcp://"):
-                # tcp://0.tcp.ngrok.io:PORT → rtmp://0.tcp.ngrok.io:PORT/live
-                result["rtmp"] = "rtmp://" + pub[6:] + "/live"
+    for t in hls_tunnels:
+        pub = t.get("public_url", "")
+        if pub.startswith("https://"):
+            result["hls"] = pub
+            break
 
-        _ngrok_cache = result
-        _ngrok_cache_ts = now
-    except Exception:
-        pass  # ngrok 未起動の場合は空を返す
+    for t in rtmp_tunnels:
+        pub = t.get("public_url", "")
+        if pub.startswith("tcp://"):
+            # tcp://0.tcp.ngrok.io:PORT → rtmp://0.tcp.ngrok.io:PORT/live
+            result["rtmp"] = "rtmp://" + pub[6:] + "/live"
+            break
 
+    _ngrok_cache = result
+    _ngrok_cache_ts = now
     return result
 
 

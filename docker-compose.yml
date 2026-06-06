@@ -1,9 +1,20 @@
 version: "3.8"
 
+# ============================================================
+#  SYCS Stream Server — docker-compose.yml
+#  すべての設定値は .env (または Portainer の Environment 欄) で上書き可能
+# ============================================================
+
 services:
+
+  # ── RTMP 受信 + FFmpeg NVENC エンコード + LL-HLS 生成 ──────────────────────
   media-server:
-    build: ./media-server
-    container_name: sycs-media-server
+    build:
+      context: ./media-server
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.3.1-runtime-ubuntu22.04}
+    image: sycs-media-server:latest
+    container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     ports:
       - "${RTMP_PORT:-1935}:1935"
     volumes:
@@ -19,19 +30,21 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: ${GPU_COUNT:-1}
               capabilities: [gpu]
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "1935"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: ${HC_INTERVAL:-10s}
+      timeout: ${HC_TIMEOUT:-5s}
+      retries: ${HC_RETRIES:-5}
       start_period: 10s
 
+  # ── HLS HTTP 配信 + ポータルサイト ──────────────────────────────────────────
   api-server:
     build: ./api-server
-    container_name: sycs-api-server
+    image: sycs-api-server:latest
+    container_name: ${API_CONTAINER:-sycs-api-server}
     ports:
       - "${API_PORT:-8080}:8080"
     volumes:
@@ -39,30 +52,48 @@ services:
     environment:
       - HLS_DIR=/hls
       - LOG_LEVEL=${LOG_LEVEL:-info}
-    restart: unless-stopped
+      - NGROK_HLS_API=${NGROK_HLS_API:-http://ngrok-hls:4040}
+      - NGROK_RTMP_API=${NGROK_RTMP_API:-http://ngrok-rtmp:4040}
+      - NGROK_CACHE_TTL=${NGROK_CACHE_TTL:-30}
+    restart: ${RESTART_POLICY:-unless-stopped}
     depends_on:
       media-server:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      interval: ${HC_INTERVAL:-10s}
+      timeout: ${HC_TIMEOUT:-5s}
+      retries: ${HC_RETRIES:-3}
       start_period: 5s
 
-  ngrok:
+  # ── ngrok: HLS / ポータル公開 (HTTPS) ──────────────────────────────────────
+  ngrok-hls:
     image: ngrok/ngrok:latest
-    container_name: sycs-ngrok
-    command: start --all --config /etc/ngrok/ngrok.yml
-    volumes:
-      - ./ngrok/ngrok.yml:/etc/ngrok/ngrok.yml:ro
+    container_name: ${NGROK_HLS_CONTAINER:-sycs-ngrok-hls}
+    # NGROK_HLS_TARGET を env で変更可 (例: 別ホストに向ける場合)
+    command: http --log=stdout ${NGROK_HLS_TARGET:-sycs-api-server:8080}
     environment:
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
     ports:
-      - "4040:4040"   # ngrok Web UI (管理用)
-    restart: unless-stopped
+      - "${NGROK_HLS_UI_PORT:-4040}:4040"
+    restart: ${RESTART_POLICY:-unless-stopped}
     depends_on:
       api-server:
+        condition: service_healthy
+
+  # ── ngrok: RTMP ingest 公開 (TCP) ─────────────────────────────────────────
+  # LAN 内から OBS 配信する場合はこのサービスは不要 (コメントアウト可)
+  ngrok-rtmp:
+    image: ngrok/ngrok:latest
+    container_name: ${NGROK_RTMP_CONTAINER:-sycs-ngrok-rtmp}
+    command: tcp --log=stdout ${NGROK_RTMP_TARGET:-sycs-media-server:1935}
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN}
+    ports:
+      - "${NGROK_RTMP_UI_PORT:-4041}:4040"
+    restart: ${RESTART_POLICY:-unless-stopped}
+    depends_on:
+      media-server:
         condition: service_healthy
 
 volumes:

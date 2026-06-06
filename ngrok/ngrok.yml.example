@@ -1,21 +1,20 @@
-# ngrok マルチトンネル設定テンプレート
-# 1. https://dashboard.ngrok.com で authtoken を取得
-# 2. このファイルを ngrok.yml にリネーム
-# 3. .env に NGROK_AUTHTOKEN=xxx を設定
+# ============================================================
+#  このファイルは現在使用していません。
 #
-# ★ TCP トンネル (rtmp) は ngrok の全プランで使用可能
-#    ただし URL はリスタートごとに変わる (有料プランで固定 URL 取得可)
-
-version: "2"
-
-tunnels:
-  # HLS 配信 / ポータルサイト (HTTPS)
-  hls:
-    addr: sycs-api-server:8080
-    proto: http
-    inspect: false
-
-  # RTMP ingest (OBS → サーバー、LAN 外から配信する場合)
-  rtmp:
-    addr: sycs-media-server:1935
-    proto: tcp
+#  ngrok の設定はすべて docker-compose.yml の environment と
+#  .env ファイルで管理しています。設定ファイルは不要です。
+#
+#  ── 制御している env 変数 ──────────────────────────────
+#  NGROK_AUTHTOKEN   … ngrok 認証トークン (必須)
+#  NGROK_HLS_TARGET  … HLS トンネルの向き先 (デフォルト: sycs-api-server:8080)
+#  NGROK_RTMP_TARGET … RTMP トンネルの向き先 (デフォルト: sycs-media-server:1935)
+#  NGROK_HLS_UI_PORT … ngrok HLS 管理 UI のホスト公開ポート (デフォルト: 4040)
+#  NGROK_RTMP_UI_PORT… ngrok RTMP 管理 UI のホスト公開ポート (デフォルト: 4041)
+#  ─────────────────────────────────────────────────────────
+#
+#  ngrok 有料プランで固定ドメインを使いたい場合は
+#  docker-compose.yml の ngrok-hls の command を以下のように変更してください:
+#
+#    command: http --log=stdout --domain=your-fixed.ngrok.io ${NGROK_HLS_TARGET:-sycs-api-server:8080}
+#
+# ============================================================

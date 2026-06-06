@@ -59,6 +59,10 @@ services:
       - NGROK_RTMP_API=${NGROK_RTMP_API:-http://localhost:4040}
       - NGROK_CACHE_TTL=${NGROK_CACHE_TTL:-30}
       - SITE_BASE_URL=${SITE_BASE_URL:-}
+      - MAX_SESSIONS=${MAX_SESSIONS:-100}
+      - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3.0}
+      - QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-20.0}
+      - MAX_BPS=${MAX_BPS:-1375000}
     restart: ${RESTART_POLICY:-unless-stopped}
     depends_on:
       media-server:

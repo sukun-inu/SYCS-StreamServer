@@ -3,7 +3,12 @@ SYCS Stream Server — ABR fmp4 LL-HLS 配信ポータル
 
 出力: /hls/live/<key>/master.m3u8 (ABR マスター)
   high/ … 元解像度 VBR、LL-HLS 対応プレイヤーはパーツ単位取得
-  low/  … 720p  VBR、LL-HLS 非対応プレイヤー(Android)はセグメント単位フォールバック
+  low/  … 720p  VBR、LL-HLS 非対応プレイヤーはセグメント単位フォールバック
+
+セッション管理:
+  - master.m3u8 取得時に sid を発行、playlist URI に伝播
+  - 同時接続 MAX_SESSIONS 超過時はキュー待機 (QUEUE_TIMEOUT 秒でタイムアウト)
+  - 1秒あたりの受信バイト数が MAX_BPS を超えたセッションは強制終了
 
 playlist サーブ時の自動パッチ:
   - EXT-X-PROGRAM-DATE-TIME 注入 (遅延蓄積防止)
@@ -13,7 +18,8 @@ playlist サーブ時の自動パッチ:
 import asyncio
 import os
 import re
-from collections import defaultdict
+import uuid
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +37,11 @@ HLS_DIR        = Path(os.environ.get("HLS_DIR", "/hls"))
 SITE_BASE_URL  = os.environ.get("SITE_BASE_URL", "")
 NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://localhost:4040")
 _NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
+
+MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS",    "100"))
+SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "3.0"))   # 無活動でセッション失効 (秒)
+QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))   # キュー待機タイムアウト (秒)
+MAX_BPS         = int(os.environ.get("MAX_BPS", str(11 * 1_000_000 // 8)))  # 11 Mbps → bytes/s
 
 MEDIA_TYPES: dict[str, str] = {
     ".m3u8": "application/vnd.apple.mpegurl",
@@ -162,8 +173,8 @@ def _patch_playlist(content: str) -> str:
     if not content.strip() or "#EXTM3U" not in content:
         return content
 
-    has_pdt     = "EXT-X-PROGRAM-DATE-TIME" in content
-    out:        list[str] = []
+    has_pdt      = "EXT-X-PROGRAM-DATE-TIME" in content
+    out:         list[str] = []
     pdt_inserted = False
 
     for line in content.splitlines(keepends=True):
@@ -197,14 +208,109 @@ def _estimate_first_segment_pdt(content: str) -> str | None:
     return first.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def _inject_sid(content: str, sid: str) -> str:
+    """playlist 内のすべての URI に ?sid=<sid> を付与する。"""
+    # タグ内の URI="..." (? を含まないもの)
+    content = re.sub(r'(URI="[^"?]+)"', rf'\1?sid={sid}"', content)
+    # 裸の URI 行 (# で始まらない行)
+    out = []
+    for line in content.splitlines(keepends=True):
+        tag = line.rstrip("\r\n")
+        if tag and not tag.startswith("#") and "?" not in tag:
+            out.append(f"{tag}?sid={sid}\n")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+# ─── セッション管理 ───────────────────────────────────────────────────────────
+#
+# master.m3u8 取得時に sid を発行し、playlist URI 書き換えで後続リクエストに伝播。
+# 満員時はキュー待機; タイムアウトで 503。
+# 1秒スライディングウィンドウの受信バイト数が MAX_BPS を超えたら強制終了。
+
+_sessions: dict[str, float]        = {}                   # sid → last_seen
+_bw:       dict[str, deque]        = defaultdict(deque)   # sid → deque[(ts, bytes)]
+_cap_cond: asyncio.Condition       = asyncio.Condition()
+
+
+async def _acquire_session(sid: str | None) -> str:
+    """既存 sid を更新、または新規セッション取得 (満員時はキュー待機)。"""
+    loop = asyncio.get_running_loop()
+    async with _cap_cond:
+        if sid and sid in _sessions:
+            _sessions[sid] = loop.time()
+            return sid
+        deadline = loop.time() + QUEUE_TIMEOUT
+        while True:
+            if len(_sessions) < MAX_SESSIONS:
+                new_sid = uuid.uuid4().hex[:12]
+                _sessions[new_sid] = loop.time()
+                return new_sid
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise HTTPException(503, "満員です。他のお客様の退出をお待ちください。")
+            try:
+                await asyncio.wait_for(_cap_cond.wait(), timeout=min(remaining, 1.0))
+            except asyncio.TimeoutError:
+                pass
+
+
+async def _renew_session(sid: str) -> bool:
+    """既存セッションの更新。存在しなければ False を返す。"""
+    loop = asyncio.get_running_loop()
+    async with _cap_cond:
+        if sid in _sessions:
+            _sessions[sid] = loop.time()
+            return True
+        return False
+
+
+def _check_and_record_bw(sid: str, nbytes: int) -> bool:
+    """帯域記録と上限チェック。MAX_BPS 超過なら False (切断すべき) を返す。"""
+    now = asyncio.get_running_loop().time()
+    dq  = _bw[sid]
+    dq.append((now, nbytes))
+    while dq and now - dq[0][0] > 1.0:
+        dq.popleft()
+    return sum(b for _, b in dq) <= MAX_BPS
+
+
+async def _revoke_session(sid: str) -> None:
+    """セッション強制終了と待機中クライアントへの通知。"""
+    async with _cap_cond:
+        _sessions.pop(sid, None)
+        _bw.pop(sid, None)
+        _cap_cond.notify_all()
+
+
+async def _cleanup_sessions() -> None:
+    """SESSION_TIMEOUT を超えた非アクティブセッションを毎秒削除し、空き枠を通知する。"""
+    while True:
+        await asyncio.sleep(1.0)
+        loop = asyncio.get_running_loop()
+        now  = loop.time()
+        async with _cap_cond:
+            expired = [s for s, ts in _sessions.items() if now - ts > SESSION_TIMEOUT]
+            for s in expired:
+                _sessions.pop(s, None)
+                _bw.pop(s, None)
+            if expired:
+                _cap_cond.notify_all()
+
+
 # ─── アプリ ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     HLS_DIR.mkdir(parents=True, exist_ok=True)
-    task = asyncio.create_task(_watch_hls())
+    tasks = [
+        asyncio.create_task(_watch_hls()),
+        asyncio.create_task(_cleanup_sessions()),
+    ]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
 
 
 app = FastAPI(title="SYCS Stream Server", lifespan=lifespan)
@@ -248,32 +354,72 @@ async def ngrok_info():
     return await get_ngrok_urls()
 
 
+@app.get("/api/status")
+async def server_status():
+    """現在のセッション数とキャパシティを返す。"""
+    return {
+        "active":    len(_sessions),
+        "max":       MAX_SESSIONS,
+        "available": max(0, MAX_SESSIONS - len(_sessions)),
+    }
+
+
 @app.get("/hls/{path:path}")
 async def serve_hls(
     path:      str,
+    sid:       str | None = Query(default=None),
     _HLS_msn:  int | None = Query(default=None),
     _HLS_part: int | None = Query(default=None),
 ):
-    """HLS ファイル配信。LL-HLS ブロッキングリクエストと playlist パッチ処理に対応。"""
-    file_path = HLS_DIR / path
+    """
+    HLS ファイル配信。
+    - master.m3u8 : セッション確立 (満員時キュー待機)、URI に sid を付与して返す
+    - index.m3u8  : セッション更新、LL-HLS ブロッキング対応
+    - セグメント  : 帯域チェック (MAX_BPS 超過でセッション強制終了)
+    """
+    file_path   = HLS_DIR / path
+    is_master   = path.endswith("master.m3u8")
+    is_playlist = path.endswith("index.m3u8")
 
-    if path.endswith(".m3u8") and _HLS_msn is not None:
+    # ── セッション管理 ────────────────────────────────────────────────────────
+    if is_master:
+        sid = await _acquire_session(sid)          # 満員ならキュー待機
+    elif is_playlist:
+        if sid and not await _renew_session(sid):
+            raise HTTPException(403, "セッション期限切れ。再度アクセスしてください。")
+
+    # ── LL-HLS ブロッキング ───────────────────────────────────────────────────
+    if is_playlist and _HLS_msn is not None:
         await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Not found")
 
+    # ── Playlist 配信 ─────────────────────────────────────────────────────────
     if path.endswith(".m3u8"):
         try:
             async with aiofiles.open(file_path, encoding="utf-8") as f:
                 content = await f.read()
         except OSError:
             raise HTTPException(status_code=404, detail="Not found")
+        content = _patch_playlist(content)
+        if sid:
+            content = _inject_sid(content, sid)
         return Response(
-            content=_patch_playlist(content).encode("utf-8"),
+            content=content.encode("utf-8"),
             media_type="application/vnd.apple.mpegurl",
             headers=NO_CACHE_HEADERS,
         )
+
+    # ── セグメント / パーツ配信 ───────────────────────────────────────────────
+    if sid:
+        try:
+            nbytes = file_path.stat().st_size
+        except OSError:
+            raise HTTPException(status_code=404, detail="Not found")
+        if not _check_and_record_bw(sid, nbytes):
+            await _revoke_session(sid)
+            raise HTTPException(429, "帯域超過によりセッションを終了しました。")
 
     media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
     return FileResponse(file_path, media_type=media_type, headers=NO_CACHE_HEADERS)
@@ -293,6 +439,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d
 header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:12px}
 header h1{font-size:1.15rem;font-weight:700;color:#58a6ff}
 .badge{background:#1f6feb;color:#fff;font-size:.68rem;padding:2px 8px;border-radius:10px;font-weight:600;letter-spacing:.04em}
+#cap-badge{background:#1a4731;color:#56d364;margin-left:auto}
 main{max-width:1120px;margin:0 auto;padding:16px;display:grid;gap:14px}
 @media(min-width:800px){main{grid-template-columns:1fr 340px}}
 
@@ -345,6 +492,7 @@ main{max-width:1120px;margin:0 auto;padding:16px;display:grid;gap:14px}
 <header>
   <h1>SYCS Stream Server</h1>
   <span class="badge">LL-HLS</span>
+  <span class="badge" id="cap-badge">● 0 / 0</span>
 </header>
 
 <main>
@@ -446,10 +594,22 @@ function playStream(key, url) {
 }
 
 async function refresh() {
-  const [sRes, nRes] = await Promise.allSettled([
+  const [sRes, nRes, stRes] = await Promise.allSettled([
     fetch('/api/streams').then(r => r.json()),
     fetch('/api/ngrok').then(r => r.json()),
+    fetch('/api/status').then(r => r.json()),
   ]);
+
+  // キャパシティ表示
+  if (stRes.status === 'fulfilled') {
+    const st = stRes.value;
+    const pct = st.max > 0 ? st.active / st.max : 0;
+    const color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
+    const el = document.getElementById('cap-badge');
+    el.textContent = `● ${st.active} / ${st.max}`;
+    el.style.color = color;
+    el.style.background = pct >= 1 ? '#2d1b1b' : pct >= 0.8 ? '#2d2007' : '#1a4731';
+  }
 
   const localBase = location.origin;
   let extBase = localBase;

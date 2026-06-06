@@ -32,9 +32,8 @@ import uvicorn
 # ─── 設定 ────────────────────────────────────────────────────────────────────
 
 HLS_DIR        = Path(os.environ.get("HLS_DIR", "/hls"))
-# ngrok コンテナが別名の場合は env で変更可
-NGROK_HLS_API  = os.environ.get("NGROK_HLS_API",  "http://ngrok-hls:4040")
-NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://ngrok-rtmp:4040")
+SITE_BASE_URL  = os.environ.get("SITE_BASE_URL", "")
+NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://localhost:4040")
 _NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
 
 MEDIA_TYPES: dict[str, str] = {
@@ -54,8 +53,8 @@ NO_CACHE_HEADERS = {
 
 # ─── ngrok URL キャッシュ ─────────────────────────────────────────────────────
 #
-# ngrok-hls / ngrok-rtmp はそれぞれ独立したコンテナで動作し、
-# 各コンテナの :4040 に API が立つ。設定ファイル不要、env のみで制御する。
+# ngrok-rtmp が :4040 に API を公開する。設定ファイル不要、env のみで制御する。
+# サイトベース URL は SITE_BASE_URL 環境変数から取得 (Cloudflare Tunnel の公開ドメイン)。
 
 _ngrok_cache: dict[str, str] = {}
 _ngrok_cache_ts: float = 0.0
@@ -75,19 +74,9 @@ async def get_ngrok_urls() -> dict[str, str]:
         except Exception:
             return []
 
-    # 2コンテナを並行取得
-    hls_tunnels, rtmp_tunnels = await asyncio.gather(
-        _fetch_tunnels(NGROK_HLS_API),
-        _fetch_tunnels(NGROK_RTMP_API),
-    )
+    rtmp_tunnels = await _fetch_tunnels(NGROK_RTMP_API)
 
-    result: dict[str, str] = {"hls": "", "rtmp": ""}
-
-    for t in hls_tunnels:
-        pub = t.get("public_url", "")
-        if pub.startswith("https://"):
-            result["hls"] = pub
-            break
+    result: dict[str, str] = {"site": SITE_BASE_URL, "rtmp": ""}
 
     for t in rtmp_tunnels:
         pub = t.get("public_url", "")
@@ -410,7 +399,7 @@ main{max-width:1120px;margin:0 auto;padding:16px;display:grid;gap:14px}
   <div class="card" id="info-card">
     <h2>接続情報</h2>
     <div class="alert" id="ngrok-alert">
-      ⚠ ngrok の無料プランでは URL が再起動ごとに変わります。VRChat ワールドの URL は都度更新してください。有料プランで固定 URL が取得できます。
+      ⚠ ngrok 無料プランでは RTMP URL が再起動ごとに変わります。OBS の配信先 URL は ngrok-rtmp 再起動後にポータルで確認してください。
     </div>
     <div class="url-section" id="url-section">
       <div class="url-row">
@@ -507,11 +496,13 @@ async function refresh() {
 
   if (nRes.status === 'fulfilled') {
     const n = nRes.value;
-    if (n.hls) {
-      extBase = n.hls;
+    if (n.site) {
+      extBase = n.site;
+    }
+    if (n.rtmp) {
+      rtmpUrl = n.rtmp;
       document.getElementById('ngrok-alert').classList.add('show');
     }
-    if (n.rtmp) rtmpUrl = n.rtmp;
   }
   setInput('u-rtmp', rtmpUrl);
 

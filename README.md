@@ -22,27 +22,32 @@ OBS Studio
                    ▼
 ┌──────────────────────────────────────────────┐
 │ api-server (Python / FastAPI :8080)          │
-│  HLS 配信 / ポータルサイト / ngrok URL 表示   │
-└──────┬──────────────────────────────────────-┘
-       │ HTTP
-       ├──▶ ngrok-hls  (HTTPS トンネル)
-       │        │ https://xxxx.ngrok-free.app
-       │        ▼
-       │    VRChat PC / Android / ブラウザ
-       │
-       └──▶ ngrok-rtmp (TCP トンネル、LAN 外配信時)
-                │ rtmp://x.tcp.ngrok.io:PORT/live
-                ▼
-            OBS (リモート配信時)
+│  HLS 配信 / ポータルサイト / ngrok RTMP 表示 │
+└──────────────────┬───────────────────────────┘
+                   │ HTTP (localhost:8080)
+                   ▼
+┌──────────────────────────────────────────────┐
+│ Cloudflare Tunnel  ← 別スタックで管理        │
+│  :8080 → https://stream.example.com          │
+│  VRChat PC / Android / ブラウザがアクセス    │
+└──────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────┐
+│ ngrok-rtmp (TCP トンネル、LAN 外配信時)      │
+│  localhost:1935 → rtmp://x.tcp.ngrok.io:PORT │
+└──────────────────────────────────────────────┘
 ```
+
+**ネットワークモード:** 全コンテナが `network_mode: host` を使用。  
+コンテナ間通信はコンテナ名 DNS の代わりに `localhost` を使用します。
 
 **期待遅延:**
 
 | 経路 | 遅延 |
 |------|------|
 | ローカルネットワーク視聴 | ~0.5s |
-| ngrok 経由 (PC LL-HLS) | ~1〜1.5s |
-| ngrok 経由 (Android HLS) | ~1.5〜3s |
+| Cloudflare 経由 (PC LL-HLS) | ~1〜1.5s |
+| Cloudflare 経由 (Android HLS) | ~1.5〜3s |
 
 ---
 
@@ -73,7 +78,8 @@ cd SYCS-StreamServer
 ```bash
 cp .env.example .env
 nano .env
-# NGROK_AUTHTOKEN=xxx  を必ず設定
+# NGROK_AUTHTOKEN=xxx          を必ず設定
+# SITE_BASE_URL=https://...    Cloudflare Tunnel の公開ドメインを設定
 ```
 
 > **Portainer を使う場合:** `.env` ファイルを作成せず、Portainer の  
@@ -141,17 +147,23 @@ Portainer の **Stacks → Add stack → Repository** から:
 
 ## 設定パラメータ一覧
 
-### ngrok
+### Cloudflare Tunnel / サイト公開
+
+| 変数 | デフォルト | 説明 |
+|------|-----------|------|
+| `SITE_BASE_URL` | *(空文字)* | Cloudflare Tunnel の公開ドメイン (例: `https://stream.example.com`) |
+
+> Cloudflare Tunnel のコンテナは **別スタック** で管理します。  
+> このリポジトリには含まれません。Cloudflare Zero Trust ダッシュボードで  
+> トンネルを作成し、`localhost:8080` を公開してください。
+
+### ngrok (RTMP 公開)
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `NGROK_AUTHTOKEN` | *(必須)* | ngrok 認証トークン |
-| `NGROK_HLS_TARGET` | `sycs-api-server:8080` | HLS トンネル向き先 |
-| `NGROK_RTMP_TARGET` | `sycs-media-server:1935` | RTMP トンネル向き先 |
-| `NGROK_HLS_UI_PORT` | `4040` | HLS ngrok 管理 UI ポート |
-| `NGROK_RTMP_UI_PORT` | `4041` | RTMP ngrok 管理 UI ポート |
-| `NGROK_HLS_API` | `http://ngrok-hls:4040` | FastAPI が参照する HLS ngrok API |
-| `NGROK_RTMP_API` | `http://ngrok-rtmp:4040` | FastAPI が参照する RTMP ngrok API |
+| `NGROK_RTMP_TARGET` | `localhost:1935` | RTMP トンネル向き先 |
+| `NGROK_RTMP_API` | `http://localhost:4040` | FastAPI が参照する ngrok API URL |
 | `NGROK_CACHE_TTL` | `30` | ngrok URL キャッシュ秒数 |
 
 ### エンコード / HLS
@@ -179,7 +191,6 @@ Portainer の **Stacks → Add stack → Repository** から:
 | `HC_RETRIES` | `3` | ヘルスチェック失敗許容回数 |
 | `MEDIA_CONTAINER` | `sycs-media-server` | メディアサーバーコンテナ名 |
 | `API_CONTAINER` | `sycs-api-server` | API サーバーコンテナ名 |
-| `NGROK_HLS_CONTAINER` | `sycs-ngrok-hls` | ngrok HLS コンテナ名 |
 | `NGROK_RTMP_CONTAINER` | `sycs-ngrok-rtmp` | ngrok RTMP コンテナ名 |
 
 ---
@@ -202,8 +213,6 @@ SYCS-StreamServer/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── main.py               ← FastAPI ポータル + HLS 配信 + ngrok 取得
-├── cloudflared/
-│   └── config.yml.example    ← 代替手段 (Cloudflare Tunnel を使う場合)
 └── ngrok/
     └── ngrok.yml.example     ← 参照用 (現在は使用しない)
 ```
@@ -212,22 +221,25 @@ SYCS-StreamServer/
 
 ## トラブルシューティング
 
-### ngrok URL が表示されない
+### ngrok RTMP URL が表示されない
 
 ```bash
-# ngrok コンテナのログを確認
-docker compose logs ngrok-hls
+# ngrok-rtmp コンテナのログを確認
 docker compose logs ngrok-rtmp
 
 # よくある原因:
 # - NGROK_AUTHTOKEN が未設定または誤り
-# - ngrok アカウントのトンネル上限に達している (無料: 1トンネル/アカウント)
+# - ngrok アカウントのトンネル上限に達している (無料: TCP 1トンネル/アカウント)
 ```
 
-> **無料プランの注意:** ngrok 無料プランはHTTPとTCPそれぞれ1トンネルまで。  
-> HLS と RTMP を同時に使う場合は有料プランが必要です。  
-> LAN 内から OBS 配信する場合は `ngrok-rtmp` サービスをコメントアウトして  
-> 1トンネルを節約できます。
+> **無料プランの注意:** ngrok 無料プランは TCP トンネル 1 本まで。  
+> LAN 内から OBS 配信する場合は `ngrok-rtmp` サービスをコメントアウトできます。
+
+### Cloudflare Tunnel 経由でアクセスできない
+
+このリポジトリは Cloudflare Tunnel のコンテナを含みません。  
+別スタックで `cloudflared` を起動し、`localhost:8080` をトンネル経由で公開してください。  
+公開ドメインを `SITE_BASE_URL` に設定するとポータルの URL 表示に反映されます。
 
 ### GPU が認識されない
 

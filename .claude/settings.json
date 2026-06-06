@@ -1,10 +1,12 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(git push *)",
+      "Bash(docker run *)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ],
     "additionalDirectories": [
       "c:\\Users\\Kawasaki\\.claude\\projects\\c--Users-Kawasaki-Desktop-Develop-SYCS-StreamServer\\memory"
-    ],
-    "allow": [
-      "Bash(git push *)"
     ]
   }
 }

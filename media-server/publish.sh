@@ -24,11 +24,13 @@ HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 OUTPUT_DIR="/hls/${STREAM_NAME}"
 mkdir -p "${OUTPUT_DIR}/high" "${OUTPUT_DIR}/low"
 
+FFMPEG_EXIT=0
+
 cleanup() {
     trap - EXIT TERM INT HUP
     [ -n "${PID}" ] && kill "${PID}" 2>/dev/null
     wait 2>/dev/null
-    exit 0
+    exit "${FFMPEG_EXIT}"
 }
 trap cleanup EXIT TERM INT HUP
 
@@ -73,7 +75,7 @@ ffmpeg \
     -f hls \
     -hls_time "${HLS_SEGMENT_TIME}" \
     -hls_list_size "${HLS_LIST_SIZE}" \
-    -hls_flags delete_segments+split_by_time+low_latency+temp_file+program_date_time \
+    -hls_flags delete_segments+split_by_time+temp_file+program_date_time \
     -hls_segment_type fmp4 \
     -hls_fmp4_init_filename "init_%v.mp4" \
     -hls_part_duration "${HLS_PART_DURATION}" \
@@ -83,4 +85,7 @@ ffmpeg \
     "${OUTPUT_DIR}/%v/index.m3u8" &
 PID=$!
 
-wait "${PID}" 2>/dev/null || true
+wait "${PID}" 2>/dev/null || FFMPEG_EXIT=$?
+FFMPEG_EXIT="${FFMPEG_EXIT:-0}"
+[ "${FFMPEG_EXIT}" -ne 0 ] && echo "[publish:${STREAM_NAME}] ffmpeg exited with code ${FFMPEG_EXIT}" >&2
+exit "${FFMPEG_EXIT}"

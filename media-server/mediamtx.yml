@@ -10,9 +10,10 @@ webrtc: no
 srt: no
 
 paths:
-  # OBS が rtmp://host:1935/live でアプリ名 "live"、ストリームキー "kawasaki" を使う場合
-  # mediamtx が作成するパスは "live/kawasaki" になる。
-  # runOnPublish は環境変数 MTX_PATH="live/kawasaki" を渡すため引数なしで OK。
+  # OBS が rtmp://host:1935/live でアプリ名 "live"、ストリームキー任意の場合
+  # mediamtx が作成するパスは "live/..." になる。
+  # runOnReady は環境変数 MTX_PATH="live/..." を渡すため引数なしで OK。
+  # (旧称 runOnPublish は現行バージョンで runOnReady に改名された)
   all_others:
-    runOnPublish: /usr/local/bin/publish.sh
-    runOnPublishRestart: yes
+    runOnReady: /usr/local/bin/publish.sh
+    runOnReadyRestart: yes

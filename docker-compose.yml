@@ -13,6 +13,9 @@ services:
   # ── RTMP 受信 + FFmpeg NVENC エンコード + LL-HLS 生成 ──────────────────────
   # イメージは GitHub Actions で ghcr.io にビルド済み。ローカルビルド不要。
   media-server:
+    build:
+      context: ./media-server
+      dockerfile: Dockerfile
     image: ghcr.io/sukun-inu/sycs-media-server:latest
     container_name: ${MEDIA_CONTAINER:-sycs-media-server}
     network_mode: host

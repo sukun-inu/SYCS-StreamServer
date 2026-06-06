@@ -1,0 +1,18 @@
+logLevel: info
+logDestinations: [stdout]
+
+# RTMP ingest (OBS → port 1935)
+rtmpAddress: :1935
+
+# 不要なプロトコルを無効化
+hls: no
+webrtc: no
+srt: no
+
+paths:
+  # OBS が rtmp://host:1935/live でアプリ名 "live"、ストリームキー "kawasaki" を使う場合
+  # mediamtx が作成するパスは "live/kawasaki" になる。
+  # runOnPublish は環境変数 MTX_PATH="live/kawasaki" を渡すため引数なしで OK。
+  all_others:
+    runOnPublish: /usr/local/bin/publish.sh
+    runOnPublishRestart: yes

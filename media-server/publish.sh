@@ -1,22 +1,18 @@
 #!/bin/bash
+# mediamtx が環境変数 MTX_PATH="live/kawasaki" を渡す。
+# argv 渡しに依存しないため nginx-rtmp の exec_push 問題は発生しない。
 
-# ${1:?} より前に引数をログ (set -e なし、失敗しても続行)
-echo "$(date -u +%FT%TZ) [publish-debug] PID=$$ args=$# argv: $*" \
-    >> /tmp/publish_debug.log 2>&1 || true
-
-STREAM_NAME="${1}"
+STREAM_NAME="${MTX_PATH##*/}"
 if [ -z "${STREAM_NAME}" ]; then
-    echo "$(date -u +%FT%TZ) [publish-error] stream name empty, argv: $*" \
-        >> /tmp/publish_debug.log 2>&1 || true
+    echo "$(date -u +%FT%TZ) [publish-error] MTX_PATH が未設定または不正: MTX_PATH='${MTX_PATH}'" >&2
     exit 1
 fi
 
 set -e
 
-# exec_push は stdout/stderr を閉じるためファイルに出力する
 LOG="/tmp/publish_${STREAM_NAME}.log"
 exec >>"${LOG}" 2>&1
-echo "[publish:$$] $(date -u +%FT%TZ) start key=${STREAM_NAME}"
+echo "[publish:$$] $(date -u +%FT%TZ) start key=${STREAM_NAME} MTX_PATH=${MTX_PATH}"
 
 VIDEO_BITRATE="${VIDEO_BITRATE:-6000k}"
 VIDEO_BITRATE_LOW="${VIDEO_BITRATE_LOW:-2000k}"
@@ -36,7 +32,6 @@ cleanup() {
 }
 trap cleanup EXIT TERM INT HUP
 
-# VBR パラメータ計算: maxrate = avg × 1.35、bufsize = maxrate × 2
 vbr_params() {
     local n="${1%k}"
     echo "${n}k $(( n * 135 / 100 ))k $(( n * 135 / 50 ))k"
@@ -44,8 +39,6 @@ vbr_params() {
 read -r BV_H BV_H_MAX BV_H_BUF <<< "$(vbr_params "${VIDEO_BITRATE}")"
 read -r BV_L BV_L_MAX BV_L_BUF <<< "$(vbr_params "${VIDEO_BITRATE_LOW}")"
 
-# h264_nvenc エンコーダの有無を確認する。
-# -hwaccels はデコード用アクセラレーション一覧であり NVENC (エンコーダ) は出ない。
 if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc'; then
     echo "[publish:${STREAM_NAME}] h264_nvenc ABR VBR  high=${BV_H} low=${BV_L}"
     VC=(
@@ -68,7 +61,7 @@ ffmpeg \
     -loglevel warning \
     -fflags +genpts \
     -use_wallclock_as_timestamps 1 \
-    -i "rtmp://127.0.0.1:1935/live/${STREAM_NAME}" \
+    -i "rtmp://127.0.0.1:1935/${MTX_PATH}" \
     -filter_complex "[0:v]split=2[vh][vl];[vl]scale=-2:720[vls]" \
     -map "[vh]"  -map 0:a \
     -map "[vls]" -map 0:a \

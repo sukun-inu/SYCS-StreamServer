@@ -156,14 +156,14 @@ OBS
  │ RTMP :1935  (app="live", streamkey={key})
  ▼
 mediamtx (media-server)
- │ LL-HLS ネイティブ書き出し ──────────────────────────────────────────────
- │   /hls/live/{key}/index.m3u8      ← EXT-X-PART 付き、100ms パーツ
- │   /hls/live/{key}/seg*.mp4
+ │ LL-HLS ネイティブ生成 ────────────────────────────────────────────────
+ │   http://127.0.0.1:8888/live/{key}/index.m3u8
+ │   /hls/live/{key}/seg*.mp4        ← hlsDirectory に保存されるセグメント
  │
  └── runOnReady → publish.sh
       └── FFmpeg (RTSP:8554 → 720p → RTMP:1935/{key}_transcode)
            ↓ mediamtx が再受信
-           /hls/live/{key}_transcode/index.m3u8
+           http://127.0.0.1:8888/live/{key}_transcode/index.m3u8
            /hls/live/{key}_transcode/seg*.mp4
 
            ↓ Docker Volume (hls-data)
@@ -176,8 +176,8 @@ FastAPI (api-server :8080)
  │   WS   /ws/hls/{key}?token=xxx
  │        → セッション確保
  │        → master コンテンツ生成・プッシュ
- │        → watchfiles で index.m3u8 変更を検知
- │        → プレイリスト読み取り → セグメント URL を HMAC 署名に書き換え → プッシュ
+ │        → MediaMTX HLS を100ms間隔で監視
+ │        → プレイリスト取得 → セグメント URL を HMAC 署名に書き換え → プッシュ
  │   GET  /seg/live/{key}/seg*.mp4?exp=T&sig=S
  │        → 署名検証 (120s TTL) → ファイル配信
  │
@@ -186,9 +186,9 @@ FastAPI (api-server :8080)
  │        → api-server が動的生成 (mediamtx は書かない)
  │        → sid セッション確保、_inject_sid で URL に sid を付与
  │   GET  /hls/live/{key}/index.m3u8?_HLS_msn=N&_HLS_part=P&sid=S
- │        → watchfiles イベント待機 (LL-HLS ブロッキング) → パッチ済みで返す
+ │        → MediaMTX HLS から取得 → パッチ済みで返す
  │   GET  /hls/live/{key}/*.mp4?sid=S
- │        → sid 帯域チェック → ファイル配信
+ │        → sid 帯域チェック → ファイル配信 (不足時はMediaMTXへフォールバック)
  │
  └─ [ポータル /]
      WS /ws → ngrok URL・セッション数をリアルタイムプッシュ
@@ -229,20 +229,19 @@ Cloudflare Tunnel / ブラウザ / VRChat
 
 ## 5. LL-HLS 実装仕様
 
-### 5.1 HLS ファイル構成 (mediamtx 書き出し)
+### 5.1 HLS 構成
 
 ```
 /hls/live/
 ├── {key}/
-│   ├── index.m3u8          EXT-X-PART 付き LL-HLS メディアプレイリスト (high)
 │   ├── init.mp4            fmp4 初期化セグメント
 │   └── seg*.mp4            セグメント / パーツ
 └── {key}_transcode/
-    ├── index.m3u8          LL-HLS メディアプレイリスト (low, 720p)
     ├── init.mp4
     └── seg*.mp4
 ```
 
+LL-HLS の `index.m3u8` は api-server が `MEDIAMTX_HLS_URL` から取得し、`/hls` 上のファイルはフォールバックとして扱う。
 master.m3u8 は **mediamtx が生成しない**。api-server が動的生成する。
 
 ### 5.2 master.m3u8 動的生成 (api-server)
@@ -501,6 +500,8 @@ GET /hls/live/{key}/index.m3u8?_HLS_msn=44&_HLS_part=2&sid=abc123
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
+| `MEDIAMTX_HLS_URL` | `http://127.0.0.1:8888` | api-server がMediaMTXのLL-HLSプレイリスト/セグメントを読む内部URL |
+| `MEDIAMTX_HLS_TIMEOUT` | `1.0` | MediaMTX HLS取得タイムアウト秒数 |
 | `SEGMENT_SECRET` | *(起動ごとランダム)* | セグメント URL 署名 HMAC シークレット。固定したい場合は明示設定 |
 | `SEGMENT_TTL` | `120` | 署名付きセグメント URL の有効期限 (秒) |
 | `SEGMENT_WAIT_TIMEOUT` | `1.5` | LL-HLS の PRELOAD-HINT が未生成 part を先読みした時に待つ秒数 |

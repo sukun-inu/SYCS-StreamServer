@@ -22,6 +22,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import aiofiles
 import httpx
@@ -42,6 +43,8 @@ SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "15.0"))
 QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))
 MAX_BPS         = int(os.environ.get("MAX_BPS", str(3_000_000)))
 SEGMENT_WAIT_TIMEOUT = float(os.environ.get("SEGMENT_WAIT_TIMEOUT", "1.5"))
+MEDIAMTX_HLS_URL = os.environ.get("MEDIAMTX_HLS_URL", "http://127.0.0.1:8888").rstrip("/")
+MEDIAMTX_HLS_TIMEOUT = float(os.environ.get("MEDIAMTX_HLS_TIMEOUT", "1.0"))
 
 # セグメント URL 署名用シークレット (env 未設定時は起動ごとにランダム生成)
 _SEGMENT_SECRET: bytes = (os.environ.get("SEGMENT_SECRET", "") or uuid.uuid4().hex).encode()
@@ -70,6 +73,7 @@ NO_CACHE_HEADERS = {
 _ngrok_cache:    dict[str, str] = {}
 _ngrok_cache_ts: float          = 0.0
 _local_ip:       str            = ""
+_hls_client: httpx.AsyncClient | None = None
 
 
 def _get_local_ip() -> str:
@@ -126,7 +130,7 @@ async def _broadcast(msg: dict) -> None:
             await ws.send_text(text)
         except Exception:
             dead.add(ws)
-    _ws_clients -= dead
+    _ws_clients.difference_update(dead)
 
 
 async def _current_status() -> dict:
@@ -208,6 +212,54 @@ async def _watch_hls() -> None:
         pass
 
 
+def _mediamtx_hls_url(rel_path: str) -> str:
+    safe_path = quote(rel_path.lstrip("/"), safe="/-_.~")
+    return f"{MEDIAMTX_HLS_URL}/{safe_path}"
+
+
+async def _fetch_mediamtx_hls(
+    rel_path: str,
+    params: dict[str, int] | None = None,
+) -> bytes | None:
+    client = _hls_client
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=MEDIAMTX_HLS_TIMEOUT)
+        close_client = True
+    try:
+        r = await client.get(_mediamtx_hls_url(rel_path), params=params)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.content
+    except Exception:
+        return None
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+async def _read_playlist_content(
+    rel_path: str,
+    params: dict[str, int] | None = None,
+) -> str | None:
+    file_path = HLS_DIR / rel_path
+    if file_path.exists() and params is None:
+        try:
+            async with aiofiles.open(file_path, encoding="utf-8") as f:
+                return await f.read()
+        except OSError:
+            pass
+
+    data = await _fetch_mediamtx_hls(rel_path, params=params)
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 async def _block_until_ready(
     rel_path:  str,
     file_path: Path,
@@ -280,23 +332,29 @@ def _playlist_satisfies(content: str, msn: int, part: int | None) -> bool:
     return tail.count("#EXT-X-PART:") > part
 
 
-def _playlist_state(key: str) -> dict:
+async def _playlist_state(key: str) -> dict:
     variants = {
-        "high": HLS_DIR / "live" / key / "index.m3u8",
-        "low":  HLS_DIR / "live" / f"{key}_transcode" / "index.m3u8",
+        "high": ("live/{}/index.m3u8".format(key), HLS_DIR / "live" / key / "index.m3u8"),
+        "low":  ("live/{}_transcode/index.m3u8".format(key), HLS_DIR / "live" / f"{key}_transcode" / "index.m3u8"),
     }
     state: dict[str, dict] = {}
     now = time.time()
-    for name, path in variants.items():
+    for name, (rel_path, path) in variants.items():
         try:
             st = path.stat()
             state[name] = {
                 "ready": True,
+                "source": "disk",
                 "age_sec": max(0.0, round(now - st.st_mtime, 3)),
                 "bytes": st.st_size,
             }
         except OSError:
-            state[name] = {"ready": False}
+            content = await _read_playlist_content(rel_path)
+            state[name] = {
+                "ready": content is not None,
+                "source": "mediamtx" if content is not None else "missing",
+                "bytes": len(content.encode("utf-8")) if content is not None else 0,
+            }
     return state
 
 
@@ -395,16 +453,17 @@ def _sign_playlist_segments(content: str, base_key: str) -> str:
     """m3u8 内の URI= タグと素のセグメント行を /seg/ 署名付き絶対 URL に書き換える。"""
     def _sign_uri(m: re.Match) -> str:
         uri = m.group(1)
-        if uri.startswith(("http://", "https://", "/seg/", "/")):
+        if uri.startswith(("http://", "https://", "/seg/", "/", "../")):
             return m.group(0)
         rel = f"live/{base_key}/{uri}"
         return f'URI="{_sign_segment_url(rel)}"'
 
-    content = re.sub(r'URI="([^"]+)"', _sign_uri, content)
-
     out = []
     for line in content.splitlines(keepends=True):
         tag = line.rstrip("\r\n")
+        if tag.startswith(("#EXT-X-MAP:", "#EXT-X-PART:", "#EXT-X-PRELOAD-HINT:")):
+            out.append(re.sub(r'URI="([^"]+)"', _sign_uri, line))
+            continue
         if tag and not tag.startswith("#") and not tag.startswith("/") and not tag.startswith("http"):
             rel = f"live/{base_key}/{tag}"
             out.append(_sign_segment_url(rel) + "\n")
@@ -527,7 +586,9 @@ async def _cleanup_sessions() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _hls_client
     HLS_DIR.mkdir(parents=True, exist_ok=True)
+    _hls_client = httpx.AsyncClient(timeout=MEDIAMTX_HLS_TIMEOUT)
     tasks = [
         asyncio.create_task(_watch_hls()),
         asyncio.create_task(_poll_hls_changes()),
@@ -535,9 +596,13 @@ async def lifespan(_: FastAPI):
         asyncio.create_task(_cleanup_tokens()),
         asyncio.create_task(_ws_broadcaster()),
     ]
-    yield
-    for t in tasks:
-        t.cancel()
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        await _hls_client.aclose()
+        _hls_client = None
 
 
 app = FastAPI(title="SYCS Stream Server", lifespan=lifespan)
@@ -562,7 +627,7 @@ async def health():
 async def stream_info(key: str):
     if not _KEY_RE.match(key):
         raise HTTPException(400, "無効なストリームキーです。")
-    variants = _playlist_state(key)
+    variants = await _playlist_state(key)
     active = variants["high"]["ready"]
     return {
         "key":     key,
@@ -644,38 +709,49 @@ async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
         _ws_hls_queues[high_rel].append(q)
         _ws_hls_queues[low_rel].append(q)
 
-    async def _push_variant(variant: str, rel: str, vkey: str) -> None:
-        fp = HLS_DIR / rel
-        if not fp.exists():
-            return
-        try:
-            async with aiofiles.open(fp, encoding="utf-8") as f:
-                content = await f.read()
-            content = _patch_playlist(content)
-            content = _sign_playlist_segments(content, vkey)
-            await ws.send_json({"type": "level", "variant": variant, "content": content})
-        except OSError:
-            pass
+    last_raw: dict[str, str] = {}
+
+    async def _push_variant(variant: str, rel: str, vkey: str) -> bool:
+        raw = await _read_playlist_content(rel)
+        if raw is None or last_raw.get(variant) == raw:
+            return False
+        last_raw[variant] = raw
+        content = _patch_playlist(raw)
+        content = _sign_playlist_segments(content, vkey)
+        await ws.send_json({"type": "level", "variant": variant, "content": content})
+        return True
 
     try:
         await ws.send_json({"type": "master", "content": _build_master_content(key)})
         await _push_variant("high", high_rel, key)
         await _push_variant("low",  low_rel,  f"{key}_transcode")
 
+        loop = asyncio.get_running_loop()
+        last_ping = loop.time()
+        last_renew = loop.time()
         while True:
             try:
-                changed_rel = await asyncio.wait_for(q.get(), timeout=25.0)
+                changed_rel = await asyncio.wait_for(q.get(), timeout=0.1)
             except asyncio.TimeoutError:
-                await ws.send_json({"type": "ping"})
+                changed_rel = None
+
+            now = loop.time()
+            if now - last_renew >= 1.0:
+                last_renew = now
                 if not await _renew_session(sid):
                     break
-                continue
 
-            await _renew_session(sid)
             if changed_rel == high_rel:
                 await _push_variant("high", high_rel, key)
-            else:
+            elif changed_rel == low_rel:
                 await _push_variant("low", low_rel, f"{key}_transcode")
+            else:
+                await _push_variant("high", high_rel, key)
+                await _push_variant("low", low_rel, f"{key}_transcode")
+
+            if now - last_ping >= 25.0:
+                last_ping = now
+                await ws.send_json({"type": "ping"})
 
     except (WebSocketDisconnect, Exception):
         pass
@@ -707,14 +783,18 @@ async def serve_segment(
     except ValueError:
         raise HTTPException(400, "Invalid path")
 
-    if not file_path.exists() and not await _wait_for_file(file_path):
-        raise HTTPException(404, "Not found")
-
     media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
     seg_headers = {
         "Cache-Control": f"private, max-age={_SEGMENT_TTL}",
         "Access-Control-Allow-Origin": "*",
     }
+
+    if not file_path.exists() and not await _wait_for_file(file_path):
+        data = await _fetch_mediamtx_hls(path)
+        if data is None:
+            raise HTTPException(404, "Not found")
+        return Response(content=data, media_type=media_type, headers=seg_headers)
+
     return FileResponse(file_path, media_type=media_type, headers=seg_headers)
 
 
@@ -769,18 +849,18 @@ async def serve_hls(
         if sid and not await _renew_session(sid):
             raise HTTPException(403, "セッション期限切れ。再度アクセスしてください。")
 
-    if is_playlist and _HLS_msn is not None:
-        await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
-
-    if not file_path.exists():
-        if is_playlist or is_master or not await _wait_for_file(file_path):
-            raise HTTPException(status_code=404, detail="Not found")
-
     if path.endswith(".m3u8"):
-        try:
-            async with aiofiles.open(file_path, encoding="utf-8") as f:
-                content = await f.read()
-        except OSError:
+        params: dict[str, int] = {}
+        if _HLS_msn is not None:
+            params["_HLS_msn"] = _HLS_msn
+        if _HLS_part is not None:
+            params["_HLS_part"] = _HLS_part
+
+        if is_playlist and file_path.exists() and _HLS_msn is not None:
+            await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
+
+        content = await _read_playlist_content(path, params=params or None)
+        if content is None:
             raise HTTPException(status_code=404, detail="Not found")
         content = _patch_playlist(content)
         if sid:
@@ -790,6 +870,17 @@ async def serve_hls(
             media_type="application/vnd.apple.mpegurl",
             headers=NO_CACHE_HEADERS,
         )
+
+    if not file_path.exists():
+        if not await _wait_for_file(file_path):
+            data = await _fetch_mediamtx_hls(path)
+            if data is None:
+                raise HTTPException(status_code=404, detail="Not found")
+            if sid and not _check_and_record_bw(sid, len(data)):
+                await _revoke_session(sid)
+                raise HTTPException(429, "帯域超過によりセッションを終了しました。")
+            media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
+            return Response(content=data, media_type=media_type, headers=NO_CACHE_HEADERS)
 
     if sid:
         try:

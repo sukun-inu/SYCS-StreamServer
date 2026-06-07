@@ -47,6 +47,8 @@ services:
       - hls-data:/hls:ro
     environment:
       - HLS_DIR=/hls
+      - MEDIAMTX_HLS_URL=${MEDIAMTX_HLS_URL:-http://127.0.0.1:8888}
+      - MEDIAMTX_HLS_TIMEOUT=${MEDIAMTX_HLS_TIMEOUT:-1.0}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - NGROK_RTMP_API=${NGROK_RTMP_API:-http://127.0.0.1:4040}
       - NGROK_CACHE_TTL=${NGROK_CACHE_TTL:-30}

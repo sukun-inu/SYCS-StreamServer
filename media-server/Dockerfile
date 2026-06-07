@@ -11,7 +11,7 @@ ARG FFMPEG_URL=https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-st
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL "${FFMPEG_URL}" \
+    && curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64)" "${FFMPEG_URL}" \
        | tar -xJf - --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe' \
     && install -m755 /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
 

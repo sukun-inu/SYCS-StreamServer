@@ -4,7 +4,7 @@ import hmac
 import posixpath
 import re
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,7 +17,10 @@ import httpx
 from config import (
     HLS_CHANGE_POLL_INTERVAL,
     HLS_DIR,
+    HLS_MEDIA_CACHE_MAX_BYTES,
+    HLS_MEDIA_CACHE_TTL,
     HLS_MISSING_CACHE_TTL,
+    HLS_PART_HOLD_BACK_PARTS,
     MEDIAMTX_API_URLS,
     MEDIAMTX_HLS_TIMEOUT,
     MEDIAMTX_HLS_URLS,
@@ -42,6 +45,12 @@ class MediaFetch:
     base_url: str
 
 
+@dataclass(frozen=True)
+class MediaCacheEntry:
+    content: bytes
+    expires_at: float
+
+
 class HlsService:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -51,6 +60,8 @@ class HlsService:
         self._playlist_queues_lock = asyncio.Lock()
         self._playlist_resolutions: dict[str, str] = {}
         self._missing_until: dict[tuple[str, bool], float] = {}
+        self._media_cache: OrderedDict[str, MediaCacheEntry] = OrderedDict()
+        self._media_cache_bytes = 0
 
     async def start(self) -> None:
         HLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -140,7 +151,19 @@ class HlsService:
         rel_path: str,
         params: dict[str, int] | None = None,
     ) -> bytes | None:
+        cache_key = self._normalize_rel_path(rel_path)
+        if params is None and self._media_cacheable(cache_key):
+            cached = self._media_cache_get(cache_key)
+            if cached is not None:
+                return cached
+
         fetched = await self._fetch_first_mediamtx(self.rel_path_candidates(rel_path), params=params)
+        if (
+            fetched is not None
+            and params is None
+            and self._media_cacheable(cache_key)
+        ):
+            self._media_cache_put(cache_key, fetched.content)
         return fetched.content if fetched is not None else None
 
     async def read_playlist_content(
@@ -412,7 +435,7 @@ class HlsService:
         for line in content.splitlines(keepends=True):
             tag = line.rstrip("\r\n")
             if tag.startswith("#EXT-X-SERVER-CONTROL:"):
-                line = self._shrink_hold_back(tag, part_target, target_duration) + "\n"
+                line = self._stabilize_server_control(tag, part_target, target_duration) + "\n"
             if not has_pdt and not pdt_inserted and tag.startswith("#EXTINF:"):
                 pdt = self._estimate_first_segment_pdt(content)
                 if pdt:
@@ -522,18 +545,18 @@ class HlsService:
         if not include_high and not include_low:
             include_high = True
         lines = ["#EXTM3U", "#EXT-X-VERSION:6"]
-        if include_high:
-            lines.extend(
-                [
-                    "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high",
-                    high_uri,
-                ]
-            )
         if include_low:
             lines.extend(
                 [
                     "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low",
                     low_uri,
+                ]
+            )
+        if include_high:
+            lines.extend(
+                [
+                    "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high",
+                    high_uri,
                 ]
             )
         return "\n".join(lines) + "\n"
@@ -866,6 +889,34 @@ class HlsService:
     def _segment_sig_payload(self, rel_path: str, exp: int, source_query: str = "") -> str:
         return f"{rel_path}:{source_query}:{exp}" if source_query else f"{rel_path}:{exp}"
 
+    def _media_cacheable(self, rel_path: str) -> bool:
+        path, _query = self._split_rel_url(rel_path)
+        return not path.endswith(".m3u8") and HLS_MEDIA_CACHE_TTL > 0 and HLS_MEDIA_CACHE_MAX_BYTES > 0
+
+    def _media_cache_get(self, key: str) -> bytes | None:
+        entry = self._media_cache.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at <= time.monotonic():
+            self._media_cache_bytes -= len(entry.content)
+            self._media_cache.pop(key, None)
+            return None
+        self._media_cache.move_to_end(key)
+        return entry.content
+
+    def _media_cache_put(self, key: str, content: bytes) -> None:
+        size = len(content)
+        if size > HLS_MEDIA_CACHE_MAX_BYTES:
+            return
+        old = self._media_cache.pop(key, None)
+        if old is not None:
+            self._media_cache_bytes -= len(old.content)
+        self._media_cache[key] = MediaCacheEntry(content, time.monotonic() + HLS_MEDIA_CACHE_TTL)
+        self._media_cache_bytes += size
+        while self._media_cache_bytes > HLS_MEDIA_CACHE_MAX_BYTES and self._media_cache:
+            _old_key, old_entry = self._media_cache.popitem(last=False)
+            self._media_cache_bytes -= len(old_entry.content)
+
     def _is_media_playlist(self, content: str) -> bool:
         return "#EXT-X-MEDIA-SEQUENCE:" in content or "#EXTINF:" in content
 
@@ -926,7 +977,7 @@ class HlsService:
         except ValueError:
             return None
 
-    def _shrink_hold_back(
+    def _stabilize_server_control(
         self,
         line: str,
         part_target: float | None,
@@ -934,13 +985,12 @@ class HlsService:
     ) -> str:
         def part_repl(match: re.Match) -> str:
             current = float(match.group(1))
-            lower = (part_target or 0.1) * 3
-            return f"PART-HOLD-BACK={max(lower, current * 0.6):.3f}"
+            lower = (part_target or 0.1) * HLS_PART_HOLD_BACK_PARTS
+            return f"PART-HOLD-BACK={max(lower, current):.3f}"
 
         def hold_repl(match: re.Match) -> str:
             current = float(match.group(1))
-            lower = (target_duration or 1.0) * 3
-            return f"HOLD-BACK={max(lower, current * 0.6):.3f}"
+            return f"HOLD-BACK={current:.3f}"
 
         line = re.sub(r"\bPART-HOLD-BACK=([\d.]+)", part_repl, line)
         return re.sub(r"(?<!PART-)\bHOLD-BACK=([\d.]+)", hold_repl, line)

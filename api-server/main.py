@@ -275,10 +275,7 @@ async def serve_segment(
     _ensure_hls_path(file_path)
 
     media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
-    headers = {
-        "Cache-Control": f"private, max-age={SEGMENT_TTL}",
-        "Access-Control-Allow-Origin": "*",
-    }
+    headers = _media_response_headers()
 
     disk_path = hls.find_existing_file(path)
     if disk_path is None and not (src or path.endswith("_init.mp4")):
@@ -356,7 +353,7 @@ async def serve_hls(
             await sessions.revoke(sid)
             raise HTTPException(429, "帯域超過によりセッションを終了しました。")
         media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
-        return Response(content=data, media_type=media_type, headers=NO_CACHE_HEADERS)
+        return Response(content=data, media_type=media_type, headers=_media_response_headers())
 
     if sid:
         try:
@@ -368,7 +365,7 @@ async def serve_hls(
             raise HTTPException(429, "帯域超過によりセッションを終了しました。")
 
     media_type = MEDIA_TYPES.get(disk_path.suffix, "application/octet-stream")
-    return FileResponse(disk_path, media_type=media_type, headers=NO_CACHE_HEADERS)
+    return FileResponse(disk_path, media_type=media_type, headers=_media_response_headers())
 
 
 def _ensure_hls_path(file_path) -> None:
@@ -403,6 +400,14 @@ def _playlist_response(content: str) -> Response:
         media_type="application/vnd.apple.mpegurl",
         headers=NO_CACHE_HEADERS,
     )
+
+
+def _media_response_headers() -> dict[str, str]:
+    return {
+        "Cache-Control": f"private, max-age={SEGMENT_TTL}, immutable",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "*",
+    }
 
 
 def _read_template(name: str) -> str:

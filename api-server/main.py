@@ -210,7 +210,20 @@ async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
         return True
 
     try:
-        await ws.send_json({"type": "master", "content": hls.build_ws_master_content(key)})
+        initial_high, initial_low = await asyncio.gather(
+            hls.read_media_playlist(high_rel),
+            hls.read_media_playlist(low_rel),
+        )
+        await ws.send_json(
+            {
+                "type": "master",
+                "content": hls.build_ws_master_content(
+                    key,
+                    include_high=initial_high is not None,
+                    include_low=initial_low is not None,
+                ),
+            }
+        )
         await push_variant("high", high_rel)
         await push_variant("low", low_rel)
 
@@ -291,7 +304,12 @@ async def serve_hls(
     master_key = _dynamic_master_key(path)
     if master_key is not None:
         sid = await sessions.acquire(sid)
-        content = hls.build_http_master_content(master_key)
+        variants = await hls.playlist_state(master_key)
+        content = hls.build_http_master_content(
+            master_key,
+            include_high=variants["high"]["ready"],
+            include_low=variants["low"]["ready"],
+        )
         return _playlist_response(hls.inject_sid(content, sid))
 
     if is_master:

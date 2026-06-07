@@ -471,25 +471,47 @@ class HlsService:
                 out.append(line)
         return "".join(out)
 
-    def build_ws_master_content(self, key: str) -> str:
-        return (
-            "#EXTM3U\n"
-            "#EXT-X-VERSION:6\n"
-            "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high\n"
-            f"/hls/live/{key}/index.m3u8\n"
-            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low\n"
-            f"/hls/live/{key}_transcode/index.m3u8\n"
+    def build_ws_master_content(self, key: str, include_high: bool = True, include_low: bool = True) -> str:
+        return self._build_master_content(
+            high_uri=f"/hls/live/{key}/index.m3u8",
+            low_uri=f"/hls/live/{key}_transcode/index.m3u8",
+            include_high=include_high,
+            include_low=include_low,
         )
 
-    def build_http_master_content(self, key: str) -> str:
-        return (
-            "#EXTM3U\n"
-            "#EXT-X-VERSION:6\n"
-            "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high\n"
-            "index.m3u8\n"
-            "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low\n"
-            f"../{key}_transcode/index.m3u8\n"
+    def build_http_master_content(self, key: str, include_high: bool = True, include_low: bool = True) -> str:
+        return self._build_master_content(
+            high_uri="index.m3u8",
+            low_uri=f"../{key}_transcode/index.m3u8",
+            include_high=include_high,
+            include_low=include_low,
         )
+
+    def _build_master_content(
+        self,
+        high_uri: str,
+        low_uri: str,
+        include_high: bool,
+        include_low: bool,
+    ) -> str:
+        if not include_high and not include_low:
+            include_high = True
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6"]
+        if include_high:
+            lines.extend(
+                [
+                    "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high",
+                    high_uri,
+                ]
+            )
+        if include_low:
+            lines.extend(
+                [
+                    "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low",
+                    low_uri,
+                ]
+            )
+        return "\n".join(lines) + "\n"
 
     def rel_path_candidates(self, rel_path: str) -> list[str]:
         rel_path = self._normalize_rel_path(rel_path)
@@ -525,9 +547,9 @@ class HlsService:
     def _ordered_playlist_candidates(self, rel_path: str) -> list[str]:
         candidates = self.playlist_rel_path_candidates(rel_path)
         preferred = self._playlist_resolutions.get(rel_path)
-        if preferred not in candidates:
+        if not preferred:
             return candidates
-        return [preferred] + [candidate for candidate in candidates if candidate != preferred]
+        return self._unique_safe_rel_paths([preferred, *candidates])
 
     def segment_rel_path(self, base_rel_dir: str, uri: str) -> str | None:
         uri_path = uri.split("?", 1)[0].split("#", 1)[0].strip()
@@ -782,8 +804,10 @@ class HlsService:
         return names
 
     def _mediamtx_hls_url(self, base_url: str, rel_path: str) -> str:
-        safe_path = quote(rel_path.lstrip("/"), safe="/-_.~")
-        return f"{base_url.rstrip('/')}/{safe_path}"
+        path, query = self._split_rel_url(rel_path)
+        safe_path = quote(path.lstrip("/"), safe="/-_.~")
+        url = f"{base_url.rstrip('/')}/{safe_path}"
+        return f"{url}?{query}" if query else url
 
     def _normalize_rel_path(self, rel_path: str) -> str:
         return rel_path.replace("\\", "/").lstrip("/")
@@ -793,12 +817,18 @@ class HlsService:
         seen: set[str] = set()
         for rel_path in rel_paths:
             rel_path = self._normalize_rel_path(rel_path)
-            if not rel_path or any(part == ".." for part in rel_path.split("/")):
+            path, _query = self._split_rel_url(rel_path)
+            if not path or any(part == ".." for part in path.split("/")):
                 continue
             if rel_path not in seen:
                 seen.add(rel_path)
                 unique.append(rel_path)
         return unique
+
+    def _split_rel_url(self, rel_url: str) -> tuple[str, str]:
+        rel_url = self._normalize_rel_path(rel_url).split("#", 1)[0]
+        path, sep, query = rel_url.partition("?")
+        return path, query if sep else ""
 
     def _is_media_playlist(self, content: str) -> bool:
         return "#EXT-X-MEDIA-SEQUENCE:" in content or "#EXTINF:" in content
@@ -830,13 +860,17 @@ class HlsService:
         return self._unique_safe_rel_paths(children)
 
     def _resolve_playlist_uri(self, parent_dir: str, uri: str) -> str | None:
-        uri_path = uri.split("?", 1)[0].split("#", 1)[0].strip()
-        if not uri_path or uri_path.startswith(("http://", "https://", "/")):
+        uri = uri.split("#", 1)[0].strip()
+        if not uri or uri.startswith(("http://", "https://", "/")):
+            return None
+        uri_path, query = self._split_rel_url(uri)
+        if not uri_path:
             return None
         normalized = posixpath.normpath(posixpath.join(parent_dir, uri_path))
         if normalized == "." or normalized.startswith("../") or "/../" in normalized:
             return None
-        return self._normalize_rel_path(normalized)
+        rel_path = self._normalize_rel_path(normalized)
+        return f"{rel_path}?{query}" if query else rel_path
 
     def _playlist_float_tag(self, content: str, pattern: str) -> float | None:
         match = re.search(pattern, content)

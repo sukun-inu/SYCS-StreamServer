@@ -54,7 +54,7 @@ input.empty{color:#484f58}
     </div>
     <div class="row">
       <label>ストリームキー</label>
-      <span style="font-size:.8rem;color:#8b949e">OBS で任意の値を設定してください</span>
+      <span style="font-size:.8rem;color:#8b949e">空欄</span>
     </div>
   </div>
 
@@ -88,6 +88,7 @@ input.empty{color:#484f58}
 </main>
 <script>
 let siteBase = '';
+let rtmpBase = '';
 let ws = null;
 let reconnectTimer = null;
 let pollTimer = null;
@@ -103,12 +104,21 @@ function setVal(id, val, empty) {
 
 function applyNgrokData(d) {
   if (typeof d.site === 'string' && d.site) siteBase = d.site;
-  const hasNgrok = typeof d.rtmp === 'string' && d.rtmp !== '';
-  const displayUrl = hasNgrok ? d.rtmp : (d.rtmp_local || '');
-  if (displayUrl) setVal('u-rtmp', displayUrl, !hasNgrok);
+  const hasNgrok = typeof d.rtmp_base === 'string' && d.rtmp_base !== '';
+  rtmpBase = hasNgrok ? d.rtmp_base : (d.rtmp_local_base || '');
+  refreshRtmpUrl();
   $('ngrok-alert').classList.toggle('show', hasNgrok);
   const lanEl = $('lan-alert');
-  lanEl.style.display = !hasNgrok && displayUrl ? 'block' : 'none';
+  lanEl.style.display = !hasNgrok && rtmpBase ? 'block' : 'none';
+}
+
+function refreshRtmpUrl() {
+  const key = $('key-input').value.trim();
+  if (!rtmpBase || !key) {
+    setVal('u-rtmp', key ? '' : 'ストリームキー入力後に生成', true);
+    return;
+  }
+  setVal('u-rtmp', `${rtmpBase.replace(/\/$/, '')}/${key}`, false);
 }
 
 function applyCapacity(active, max) {
@@ -176,6 +186,7 @@ function openWatch() {
 async function checkStream() {
   const key = $('key-input').value.trim();
   if (!key) return;
+  refreshRtmpUrl();
   $('stream-result').style.display = 'block';
   try {
     const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
@@ -220,6 +231,7 @@ $('open-watch-btn').addEventListener('click', openWatch);
 $('key-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') checkStream();
 });
+$('key-input').addEventListener('input', refreshRtmpUrl);
 </script>
 </body>
 </html>

@@ -57,7 +57,9 @@ async def _current_status() -> dict:
     urls = await ngrok.urls()
     return {
         "rtmp": urls.get("rtmp", ""),
+        "rtmp_base": urls.get("rtmp_base", ""),
         "rtmp_local": urls.get("rtmp_local", ""),
+        "rtmp_local_base": urls.get("rtmp_local_base", ""),
         "site": urls.get("site", ""),
         "sessions": {"active": sessions.active, "max": sessions.max_sessions},
     }
@@ -127,6 +129,13 @@ async def stream_info(key: str):
     }
 
 
+@app.get("/api/debug/stream/{key}")
+async def stream_debug(key: str):
+    if not KEY_RE.match(key):
+        raise HTTPException(400, "無効なストリームキーです。")
+    return await hls.debug_stream(key)
+
+
 @app.get("/api/ngrok")
 async def ngrok_info():
     return await ngrok.urls()
@@ -180,7 +189,7 @@ async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
 
     await ws.accept()
 
-    high_rel = f"live/{key}/stream.m3u8"
+    high_rel = f"{key}/stream.m3u8"
     low_rel = f"live/{key}_transcode/stream.m3u8"
     rel_paths = (high_rel, low_rel)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=30)

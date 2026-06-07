@@ -30,7 +30,9 @@ class NgrokService:
         result: dict[str, str] = {
             "site": SITE_BASE_URL,
             "rtmp": "",
+            "rtmp_base": "",
             "rtmp_local": f"rtmp://{self._get_local_ip()}:1935/live",
+            "rtmp_local_base": f"rtmp://{self._get_local_ip()}:1935",
         }
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
@@ -38,7 +40,8 @@ class NgrokService:
                 for tunnel in resp.json().get("tunnels", []):
                     public_url = tunnel.get("public_url", "")
                     if public_url.startswith("tcp://"):
-                        result["rtmp"] = "rtmp://" + public_url[6:] + "/live"
+                        result["rtmp_base"] = "rtmp://" + public_url[6:]
+                        result["rtmp"] = result["rtmp_base"] + "/live"
                         break
         except Exception:
             pass

@@ -1,19 +1,23 @@
 logLevel: info
 logDestinations: [stdout]
 
+api: yes
+apiAddress: :9997
+
 rtmpAddress: :1935
 rtspAddress: :8554
 
 # ── mediamtx ネイティブ LL-HLS ───────────────────────────────────────────────
 # FFmpeg ではなく mediamtx が EXT-X-PART 付き LL-HLS を生成する。
-# hlsDirectory に書き出したファイルを api-server が静的配信する。
+# LL-HLS のプレイリストは MediaMTX の HLS HTTP から読む。
 hls: yes
-hlsAlwaysRemux: yes        # api-server が /hls を静的配信するため、視聴要求なしでも生成する
+hlsAddress: :8888
+hlsAlwaysRemux: yes        # api-server が読みに来る前からHLS muxerを動かす
 hlsVariant: lowLatency     # EXT-X-PART / EXT-X-SERVER-CONTROL 付き
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
 hlsPartDuration: 100ms
-hlsDirectory: /hls         # /hls/live/kawasaki/ のように書き出される
+hlsDirectory: /hls         # セグメントと non-low-latency playlist の保存先
 
 webrtc: no
 srt: no

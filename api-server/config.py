@@ -25,6 +25,7 @@ def _csv_env(name: str, default: str) -> list[str]:
 
 MEDIAMTX_HLS_URL = os.environ.get("MEDIAMTX_HLS_URL", "http://127.0.0.1:8888").rstrip("/")
 MEDIAMTX_HLS_URLS = _csv_env("MEDIAMTX_HLS_URLS", MEDIAMTX_HLS_URL)
+MEDIAMTX_API_URLS = _csv_env("MEDIAMTX_API_URLS", "http://127.0.0.1:9997")
 MEDIAMTX_HLS_TIMEOUT = float(os.environ.get("MEDIAMTX_HLS_TIMEOUT", "1.0"))
 HLS_MISSING_CACHE_TTL = float(os.environ.get("HLS_MISSING_CACHE_TTL", "1.0"))
 HLS_CHANGE_POLL_INTERVAL = float(os.environ.get("HLS_CHANGE_POLL_INTERVAL", "0.5"))

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import posixpath
 import re
 import time
 from collections import defaultdict
@@ -17,6 +18,7 @@ from config import (
     HLS_CHANGE_POLL_INTERVAL,
     HLS_DIR,
     HLS_MISSING_CACHE_TTL,
+    MEDIAMTX_API_URLS,
     MEDIAMTX_HLS_TIMEOUT,
     MEDIAMTX_HLS_URLS,
     SEGMENT_SECRET,
@@ -30,12 +32,14 @@ class PlaylistRead:
     content: str
     rel_path: str
     source: str
+    url: str = ""
 
 
 @dataclass(frozen=True)
 class MediaFetch:
     content: bytes
     rel_path: str
+    base_url: str
 
 
 class HlsService:
@@ -166,6 +170,30 @@ class HlsService:
             return None
 
         candidates = self._ordered_playlist_candidates(normalized_rel_path)
+
+        if params is not None and normalized_rel_path in self._playlist_resolutions:
+            candidates = [self._playlist_resolutions[normalized_rel_path]]
+
+        fetched = await self._fetch_playlist_mediamtx(
+            candidates,
+            params=params,
+            media_only=media_only,
+        )
+        if fetched is not None:
+            try:
+                content = fetched.content.decode("utf-8")
+            except UnicodeDecodeError:
+                content = ""
+            if content and (not media_only or self._is_media_playlist(content)):
+                self._playlist_resolutions[normalized_rel_path] = fetched.rel_path
+                self._missing_until.pop(cache_key, None)
+                return PlaylistRead(
+                    content,
+                    fetched.rel_path,
+                    "mediamtx",
+                    self._mediamtx_hls_url(fetched.base_url, fetched.rel_path),
+                )
+
         if params is None:
             for candidate in candidates:
                 file_path = self.find_existing_file(candidate, exact=True)
@@ -177,27 +205,9 @@ class HlsService:
                     if not media_only or self._is_media_playlist(content):
                         self._playlist_resolutions[normalized_rel_path] = candidate
                         self._missing_until.pop(cache_key, None)
-                        return PlaylistRead(content, candidate, "disk")
+                        return PlaylistRead(content, candidate, "disk", str(file_path))
                 except OSError:
                     pass
-
-        if params is not None and normalized_rel_path in self._playlist_resolutions:
-            candidates = [self._playlist_resolutions[normalized_rel_path]]
-
-        fetched = await self._fetch_first_mediamtx(
-            candidates,
-            params=params,
-            content_filter=lambda data: self._playlist_bytes_match(data, media_only),
-        )
-        if fetched is not None:
-            try:
-                content = fetched.content.decode("utf-8")
-            except UnicodeDecodeError:
-                content = ""
-            if content and (not media_only or self._is_media_playlist(content)):
-                self._playlist_resolutions[normalized_rel_path] = fetched.rel_path
-                self._missing_until.pop(cache_key, None)
-                return PlaylistRead(content, fetched.rel_path, "mediamtx")
 
         if params is None:
             self._missing_until[cache_key] = time.monotonic() + HLS_MISSING_CACHE_TTL
@@ -307,7 +317,7 @@ class HlsService:
 
     async def playlist_state(self, key: str) -> dict[str, dict]:
         variants = {
-            "high": f"live/{key}/stream.m3u8",
+            "high": f"{key}/stream.m3u8",
             "low": f"live/{key}_transcode/stream.m3u8",
         }
 
@@ -336,6 +346,54 @@ class HlsService:
         now = time.time()
         pairs = await asyncio.gather(*(variant_state(name, rel_path) for name, rel_path in variants.items()))
         return dict(pairs)
+
+    async def debug_stream(self, key: str) -> dict:
+        high_rel = f"{key}/stream.m3u8"
+        low_rel = f"live/{key}_transcode/stream.m3u8"
+        high_candidates = self.playlist_rel_path_candidates(high_rel)
+        low_candidates = self.playlist_rel_path_candidates(low_rel)
+
+        high_probe, low_probe, api_probe, high_resolved, low_resolved = await asyncio.gather(
+            self._probe_playlist_candidates(high_candidates),
+            self._probe_playlist_candidates(low_candidates),
+            self._probe_mediamtx_api_paths(),
+            self.read_media_playlist(high_rel),
+            self.read_media_playlist(low_rel),
+        )
+
+        return {
+            "key": key,
+            "hls_dir": self._debug_hls_dir(high_candidates + low_candidates),
+            "candidates": {
+                "high": high_candidates,
+                "low": low_candidates,
+            },
+            "mediamtx_hls": {
+                "base_urls": MEDIAMTX_HLS_URLS,
+                "resolved": {
+                    "high": self._debug_playlist_read(high_resolved),
+                    "low": self._debug_playlist_read(low_resolved),
+                },
+                "high": high_probe,
+                "low": low_probe,
+            },
+            "mediamtx_api": {
+                "base_urls": MEDIAMTX_API_URLS,
+                "paths": api_probe,
+            },
+        }
+
+    def _debug_playlist_read(self, playlist: PlaylistRead | None) -> dict:
+        if playlist is None:
+            return {"ready": False}
+        return {
+            "ready": True,
+            "source": playlist.source,
+            "rel_path": playlist.rel_path,
+            "url": playlist.url,
+            "bytes": len(playlist.content.encode("utf-8")),
+            "media_sequence": self._playlist_int_tag(playlist.content, r"#EXT-X-MEDIA-SEQUENCE:(\d+)"),
+        }
 
     def patch_playlist(self, content: str) -> str:
         if not content.strip() or "#EXTM3U" not in content:
@@ -440,7 +498,12 @@ class HlsService:
 
         candidates = [rel_path]
         if rel_path.startswith("live/"):
-            candidates.append(rel_path.removeprefix("live/"))
+            stripped = rel_path.removeprefix("live/")
+            path_name = stripped.split("/", 1)[0]
+            if path_name.endswith("_transcode"):
+                candidates.append(stripped)
+            else:
+                candidates = [stripped, rel_path]
         else:
             candidates.append(f"live/{rel_path}")
         return self._unique_safe_rel_paths(candidates)
@@ -511,6 +574,63 @@ class HlsService:
                 await client.aclose()
         return None
 
+    async def _fetch_playlist_mediamtx(
+        self,
+        rel_paths: list[str],
+        params: dict[str, int] | None = None,
+        media_only: bool = False,
+    ) -> MediaFetch | None:
+        pending = self._unique_safe_rel_paths(rel_paths)
+        seen: set[str] = set()
+
+        for _depth in range(3):
+            batch = [rel_path for rel_path in pending if rel_path not in seen]
+            if not batch:
+                return None
+            seen.update(batch)
+
+            fetched_items = await self._fetch_many_mediamtx(batch, params=params)
+            child_candidates: list[str] = []
+            for fetched in fetched_items:
+                try:
+                    content = fetched.content.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+
+                if not media_only or self._is_media_playlist(content):
+                    return fetched
+                child_candidates.extend(self._playlist_child_candidates(fetched.rel_path, content))
+
+            pending = self._unique_safe_rel_paths(child_candidates)
+        return None
+
+    async def _fetch_many_mediamtx(
+        self,
+        rel_paths: list[str],
+        params: dict[str, int] | None = None,
+    ) -> list[MediaFetch]:
+        rel_paths = self._unique_safe_rel_paths(rel_paths)
+        if not rel_paths:
+            return []
+
+        client = self._client
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=MEDIAMTX_HLS_TIMEOUT)
+            close_client = True
+
+        tasks = [
+            self._fetch_mediamtx_url(client, base_url, rel_path, params=params)
+            for rel_path in rel_paths
+            for base_url in MEDIAMTX_HLS_URLS
+        ]
+        try:
+            results = await asyncio.gather(*tasks)
+            return [result for result in results if result is not None]
+        finally:
+            if close_client:
+                await client.aclose()
+
     async def _fetch_mediamtx_url(
         self,
         client: httpx.AsyncClient,
@@ -523,9 +643,159 @@ class HlsService:
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
-            return MediaFetch(resp.content, rel_path)
+            return MediaFetch(resp.content, rel_path, base_url)
         except Exception:
             return None
+
+    async def _probe_playlist_candidates(self, rel_paths: list[str]) -> list[dict]:
+        client = self._client
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=MEDIAMTX_HLS_TIMEOUT)
+            close_client = True
+
+        tasks = [
+            asyncio.create_task(self._probe_mediamtx_url(client, base_url, rel_path))
+            for rel_path in self._unique_safe_rel_paths(rel_paths)
+            for base_url in MEDIAMTX_HLS_URLS
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        finally:
+            if close_client:
+                await client.aclose()
+
+    async def _probe_mediamtx_url(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        rel_path: str,
+    ) -> dict:
+        url = self._mediamtx_hls_url(base_url, rel_path)
+        result = {"base_url": base_url, "rel_path": rel_path, "url": url}
+        try:
+            resp = await client.get(url)
+            text = resp.text[:240] if resp.headers.get("content-type", "").startswith(("application", "text")) else ""
+            result.update(
+                {
+                    "status": resp.status_code,
+                    "bytes": len(resp.content),
+                    "media_playlist": self._playlist_bytes_match(resp.content, media_only=True),
+                    "content_type": resp.headers.get("content-type", ""),
+                    "head": text,
+                }
+            )
+        except Exception as exc:
+            result.update({"status": 0, "error": type(exc).__name__})
+        return result
+
+    async def _probe_mediamtx_api_paths(self) -> list[dict]:
+        results: list[dict] = []
+        async with httpx.AsyncClient(timeout=MEDIAMTX_HLS_TIMEOUT) as client:
+            for base_url in MEDIAMTX_API_URLS:
+                url = f"{base_url.rstrip('/')}/v3/paths/list"
+                result = {"base_url": base_url, "url": url}
+                try:
+                    resp = await client.get(url)
+                    result["status"] = resp.status_code
+                    if resp.headers.get("content-type", "").startswith("application/json"):
+                        data = resp.json()
+                        result["names"] = self._extract_names(data)[:50]
+                        result["raw_keys"] = list(data.keys()) if isinstance(data, dict) else []
+                    else:
+                        result["head"] = resp.text[:240]
+                except Exception as exc:
+                    result.update({"status": 0, "error": type(exc).__name__})
+                results.append(result)
+        return results
+
+    def _debug_hls_dir(self, candidates: list[str]) -> dict:
+        root = HLS_DIR
+        result: dict = {
+            "path": str(root),
+            "exists": root.exists(),
+            "is_dir": root.is_dir(),
+        }
+        try:
+            st = root.stat()
+            result.update(
+                {
+                    "mode": oct(st.st_mode & 0o777),
+                    "uid": getattr(st, "st_uid", None),
+                    "gid": getattr(st, "st_gid", None),
+                }
+            )
+        except OSError as exc:
+            result["stat_error"] = type(exc).__name__
+
+        try:
+            result["readable"] = root.is_dir() and any(True for _ in root.iterdir()) or root.is_dir()
+        except OSError as exc:
+            result["readable"] = False
+            result["read_error"] = type(exc).__name__
+
+        result["candidate_files"] = [self._debug_file(candidate) for candidate in self._unique_safe_rel_paths(candidates)]
+        entries: list[dict] = []
+        try:
+            for idx, entry in enumerate(root.glob("**/*")):
+                if idx >= 80:
+                    break
+                try:
+                    rel = str(entry.relative_to(root))
+                    st = entry.stat()
+                    entries.append(
+                        {
+                            "path": rel,
+                            "type": "dir" if entry.is_dir() else "file",
+                            "bytes": st.st_size,
+                            "mode": oct(st.st_mode & 0o777),
+                        }
+                    )
+                except OSError:
+                    pass
+        except OSError as exc:
+            result["entries_error"] = type(exc).__name__
+        result["entries"] = entries
+        return result
+
+    def _debug_file(self, rel_path: str) -> dict:
+        file_path = HLS_DIR / rel_path
+        result = {"rel_path": rel_path, "path": str(file_path)}
+        try:
+            file_path.resolve().relative_to(HLS_DIR.resolve())
+        except ValueError:
+            result["safe"] = False
+            return result
+        result["safe"] = True
+        result["exists"] = file_path.exists()
+        result["is_file"] = file_path.is_file()
+        result["is_dir"] = file_path.is_dir()
+        if result["exists"]:
+            try:
+                st = file_path.stat()
+                result.update(
+                    {
+                        "bytes": st.st_size,
+                        "mode": oct(st.st_mode & 0o777),
+                        "mtime": st.st_mtime,
+                    }
+                )
+            except OSError as exc:
+                result["stat_error"] = type(exc).__name__
+        return result
+
+    def _extract_names(self, data) -> list[str]:
+        names: list[str] = []
+        if isinstance(data, dict):
+            value = data.get("name")
+            if isinstance(value, str):
+                names.append(value)
+            for child in data.values():
+                names.extend(self._extract_names(child))
+        elif isinstance(data, list):
+            for item in data:
+                names.extend(self._extract_names(item))
+        return names
 
     def _mediamtx_hls_url(self, base_url: str, rel_path: str) -> str:
         safe_path = quote(rel_path.lstrip("/"), safe="/-_.~")
@@ -556,12 +826,49 @@ class HlsService:
             return False
         return not media_only or self._is_media_playlist(content)
 
+    def _playlist_child_candidates(self, parent_rel_path: str, content: str) -> list[str]:
+        parent_dir = posixpath.dirname(self._normalize_rel_path(parent_rel_path))
+        children: list[str] = []
+
+        for line in content.splitlines():
+            tag = line.strip()
+            if not tag or tag.startswith("#") or ".m3u8" not in tag:
+                continue
+            child = self._resolve_playlist_uri(parent_dir, tag)
+            if child:
+                children.append(child)
+
+        for match in re.finditer(r'URI="([^"]+\.m3u8(?:\?[^"]*)?)"', content):
+            child = self._resolve_playlist_uri(parent_dir, match.group(1))
+            if child:
+                children.append(child)
+
+        return self._unique_safe_rel_paths(children)
+
+    def _resolve_playlist_uri(self, parent_dir: str, uri: str) -> str | None:
+        uri_path = uri.split("?", 1)[0].split("#", 1)[0].strip()
+        if not uri_path or uri_path.startswith(("http://", "https://", "/")):
+            return None
+        normalized = posixpath.normpath(posixpath.join(parent_dir, uri_path))
+        if normalized == "." or normalized.startswith("../") or "/../" in normalized:
+            return None
+        return self._normalize_rel_path(normalized)
+
     def _playlist_float_tag(self, content: str, pattern: str) -> float | None:
         match = re.search(pattern, content)
         if not match:
             return None
         try:
             return float(match.group(1))
+        except ValueError:
+            return None
+
+    def _playlist_int_tag(self, content: str, pattern: str) -> int | None:
+        match = re.search(pattern, content)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
         except ValueError:
             return None
 

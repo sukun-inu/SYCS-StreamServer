@@ -40,7 +40,7 @@
 | 項目 | 内容 |
 |------|------|
 | ベースイメージ | `nvidia/cuda:${CUDA_VERSION}` (デフォルト: `12.6.3-runtime-ubuntu24.04`) |
-| ビルド方式 | マルチステージ: `bluenviron/mediamtx:latest` からバイナリをコピー、FFmpeg は `ubuntu:24.04` でソースビルド |
+| ビルド方式 | マルチステージ: `bluenviron/mediamtx:latest` からバイナリをコピー、FFmpeg は `apt install ffmpeg` (Ubuntu 24.04 パッケージ) |
 | プロセス | mediamtx + publish.sh (FFmpeg サブプロセス) |
 | 役割 | RTMP 受信、FFmpeg 起動管理、2バリアント HLS 生成 |
 | GPU アクセス | `deploy.resources.reservations.devices` (NVIDIA) |

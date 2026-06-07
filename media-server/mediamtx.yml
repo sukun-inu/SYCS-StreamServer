@@ -1,22 +1,23 @@
 logLevel: info
 logDestinations: [stdout]
 
-# RTMP ingest (OBS → port 1935)
 rtmpAddress: :1935
-
-# RTSP サーバー (publish.sh の FFmpeg が TCP で読む)
 rtspAddress: :8554
 
-# 不要なプロトコルを無効化
-hls: no
+# ── mediamtx ネイティブ LL-HLS ───────────────────────────────────────────────
+# FFmpeg ではなく mediamtx が EXT-X-PART 付き LL-HLS を生成する。
+# hlsDirectory に書き出したファイルを api-server が静的配信する。
+hls: yes
+hlsVariant: lowLatency     # EXT-X-PART / EXT-X-SERVER-CONTROL 付き
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 100ms
+hlsDirectory: /hls         # /hls/live/kawasaki/ のように書き出される
+
 webrtc: no
 srt: no
 
 paths:
-  # OBS が rtmp://host:1935/live でアプリ名 "live"、ストリームキー任意の場合
-  # mediamtx が作成するパスは "live/..." になる。
-  # runOnReady は OBS が接続して最初のフレームが届いた時点で発火する。
-  # publish.sh は MTX_PATH="live/key" を受け取り STREAM_NAME=key として RTSP で読む。
   all_others:
     runOnReady: /usr/local/bin/publish.sh
     runOnReadyRestart: yes

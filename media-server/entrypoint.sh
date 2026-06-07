@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-mkdir -p /hls/live
+mkdir -p /hls
 
 if ! ffmpeg -version >/dev/null 2>&1; then
     echo "[entrypoint] FATAL: ffmpeg が起動できません。" >&2
@@ -9,10 +9,6 @@ if ! ffmpeg -version >/dev/null 2>&1; then
     if command -v ldd >/dev/null 2>&1; then
         ldd "$(command -v ffmpeg)" 2>&1 | grep "not found" >&2 || true
     fi
-    exit 1
-fi
-if ! ffmpeg -encoders 2>/dev/null | grep -q 'libx264'; then
-    echo "[entrypoint] FATAL: ffmpeg が libx264 なしでビルドされています" >&2
     exit 1
 fi
 

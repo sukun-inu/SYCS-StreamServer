@@ -1,19 +1,22 @@
 """
 SYCS Stream Server — ABR fmp4 LL-HLS 配信ポータル
 
-ポータル (/) : ストリーマー向け管理画面
-  - RTMP URL をリアルタイム表示 (WebSocket)
-  - ストリームキーを入力すると視聴 URL を生成
-視聴ページ (/watch/{key}) : キーを知る視聴者向けプレイヤー
-HLS 配信 (/hls/{path}) : ABR fmp4 LL-HLS + セッション管理
-WebSocket (/ws) : ngrok RTMP URL・セッション数をブラウザにプッシュ
+ポータル (/)         : ストリーマー向け管理画面
+視聴ページ (/watch)  : WebSocket 経由でプレイリストを受信 (m3u8 URL 非公開)
+HLS 配信 (/hls)      : VRChat 向け通常 HTTP 配信 (sid セッション管理)
+セグメント (/seg)    : HMAC 署名付き短命 URL でのセグメント配信
+WebSocket (/ws)      : ngrok RTMP URL・セッション数プッシュ
+WebSocket (/ws/hls)  : LL-HLS プレイリストをリアルタイムプッシュ
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
 import socket
+import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -35,11 +38,14 @@ NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://localhost:4040")
 _NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
 
 MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS",    "100"))
-# SESSION_TIMEOUT はブロッキングタイムアウト (5s) + 余裕を考慮して 15s 以上を推奨。
-# 8s だとブロッキング中にクリーンアップが走りセッションが消える可能性がある。
 SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "15.0"))
 QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))
 MAX_BPS         = int(os.environ.get("MAX_BPS", str(3_000_000)))
+
+# セグメント URL 署名用シークレット (env 未設定時は起動ごとにランダム生成)
+_SEGMENT_SECRET: bytes = (os.environ.get("SEGMENT_SECRET", "") or uuid.uuid4().hex).encode()
+_SEGMENT_TTL = int(os.environ.get("SEGMENT_TTL", "120"))   # 秒
+_TOKEN_TTL   = int(os.environ.get("TOKEN_TTL",   "60"))    # 秒
 
 _KEY_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
@@ -104,13 +110,12 @@ async def get_ngrok_urls() -> dict[str, str]:
     return result
 
 
-# ─── WebSocket ブロードキャスト ───────────────────────────────────────────────
+# ─── WebSocket ブロードキャスト (ポータル用) ─────────────────────────────────
 
 _ws_clients: set[WebSocket] = set()
 
 
 async def _broadcast(msg: dict) -> None:
-    """全接続クライアントに JSON をプッシュ。切断済みクライアントは除去。"""
     if not _ws_clients:
         return
     text = json.dumps(msg, ensure_ascii=False)
@@ -134,7 +139,6 @@ async def _current_status() -> dict:
 
 
 async def _ws_broadcaster() -> None:
-    """ngrok URL とセッション数を 5 秒ごとに変化があればブロードキャスト。"""
     prev: dict = {}
     while True:
         await asyncio.sleep(5.0)
@@ -146,16 +150,28 @@ async def _ws_broadcaster() -> None:
             await _broadcast(state)
 
 
-# ─── LL-HLS ブロッキング ──────────────────────────────────────────────────────
+# ─── LL-HLS ファイル変更監視 ─────────────────────────────────────────────────
 
 _waiters:      dict[str, list[asyncio.Event]] = defaultdict(list)
 _waiters_lock: asyncio.Lock                   = asyncio.Lock()
 
+# WebSocket HLS プッシュ用キュー: rel_path → [Queue]
+_ws_hls_queues: dict[str, list[asyncio.Queue]] = defaultdict(list)
+_ws_hls_lock:   asyncio.Lock                   = asyncio.Lock()
+
 
 async def _notify_waiters(rel_path: str) -> None:
+    # HTTP LL-HLS ロングポール待機者
     async with _waiters_lock:
         for ev in _waiters.pop(rel_path, []):
             ev.set()
+    # WebSocket プッシュキュー
+    async with _ws_hls_lock:
+        for q in _ws_hls_queues.get(rel_path, []):
+            try:
+                q.put_nowait(rel_path)
+            except asyncio.QueueFull:
+                pass
 
 
 async def _watch_hls() -> None:
@@ -245,7 +261,7 @@ def _patch_playlist(content: str) -> str:
 
 def _shrink_hold_back(line: str) -> str:
     def _s(m: re.Match) -> str:
-        return f"HOLD-BACK={max(0.75, float(m.group(1)) * 0.6):.3f}"
+        return f"HOLD-BACK={max(0.5, float(m.group(1)) * 0.6):.3f}"
     return re.sub(r"\bHOLD-BACK=([\d.]+)", _s, line)
 
 
@@ -267,6 +283,86 @@ def _inject_sid(content: str, sid: str) -> str:
         else:
             out.append(line)
     return "".join(out)
+
+
+# ─── セグメント URL 署名 ──────────────────────────────────────────────────────
+
+def _sign_segment_url(rel_path: str) -> str:
+    exp = int(time.time()) + _SEGMENT_TTL
+    mac = hmac.new(_SEGMENT_SECRET, f"{rel_path}:{exp}".encode(), hashlib.sha256)
+    sig = mac.hexdigest()[:16]
+    return f"/seg/{rel_path}?exp={exp}&sig={sig}"
+
+
+def _verify_segment(rel_path: str, exp: str, sig: str) -> bool:
+    try:
+        if int(exp) < time.time():
+            return False
+        mac = hmac.new(_SEGMENT_SECRET, f"{rel_path}:{exp}".encode(), hashlib.sha256)
+        return hmac.compare_digest(mac.hexdigest()[:16], sig)
+    except Exception:
+        return False
+
+
+def _sign_playlist_segments(content: str, base_key: str) -> str:
+    """m3u8 内の URI= タグと素のセグメント行を /seg/ 署名付き絶対 URL に書き換える。"""
+    def _sign_uri(m: re.Match) -> str:
+        uri = m.group(1)
+        if uri.startswith(("http://", "https://", "/seg/", "/")):
+            return m.group(0)
+        rel = f"live/{base_key}/{uri}"
+        return f'URI="{_sign_segment_url(rel)}"'
+
+    content = re.sub(r'URI="([^"]+)"', _sign_uri, content)
+
+    out = []
+    for line in content.splitlines(keepends=True):
+        tag = line.rstrip("\r\n")
+        if tag and not tag.startswith("#") and not tag.startswith("/") and not tag.startswith("http"):
+            rel = f"live/{base_key}/{tag}"
+            out.append(_sign_segment_url(rel) + "\n")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def _build_master_content(key: str) -> str:
+    return (
+        "#EXTM3U\n"
+        "#EXT-X-VERSION:6\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high\n"
+        f"/hls/live/{key}/index.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low\n"
+        f"/hls/live/{key}_transcode/index.m3u8\n"
+    )
+
+
+# ─── ワンタイムトークン ───────────────────────────────────────────────────────
+
+_tokens: dict[str, tuple[str, float]] = {}   # token → (key, expiry)
+
+
+def _create_token(key: str) -> str:
+    token = uuid.uuid4().hex
+    _tokens[token] = (key, time.time() + _TOKEN_TTL)
+    return token
+
+
+def _consume_token(token: str, key: str) -> bool:
+    entry = _tokens.pop(token, None)
+    if not entry:
+        return False
+    stored_key, exp = entry
+    return stored_key == key and exp >= time.time()
+
+
+async def _cleanup_tokens() -> None:
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        expired = [t for t, (_, exp) in list(_tokens.items()) if exp < now]
+        for t in expired:
+            _tokens.pop(t, None)
 
 
 # ─── セッション管理 ───────────────────────────────────────────────────────────
@@ -348,6 +444,7 @@ async def lifespan(_: FastAPI):
     tasks = [
         asyncio.create_task(_watch_hls()),
         asyncio.create_task(_cleanup_sessions()),
+        asyncio.create_task(_cleanup_tokens()),
         asyncio.create_task(_ws_broadcaster()),
     ]
     yield
@@ -375,11 +472,10 @@ async def health():
 
 @app.get("/api/stream/{key}")
 async def stream_info(key: str):
-    """指定キーのストリーム状態を返す。配信一覧は公開しない。"""
     if not _KEY_RE.match(key):
         raise HTTPException(400, "無効なストリームキーです。")
     stream_dir = HLS_DIR / "live" / key
-    active = (stream_dir / "high" / "index.m3u8").exists()
+    active = (stream_dir / "index.m3u8").exists()
     return {
         "key":     key,
         "active":  active,
@@ -389,7 +485,6 @@ async def stream_info(key: str):
 
 @app.get("/api/ngrok")
 async def ngrok_info():
-    """ngrok RTMP URL を返す REST エンドポイント (WebSocket フォールバック用)。"""
     return await get_ngrok_urls()
 
 
@@ -402,15 +497,23 @@ async def server_status():
     }
 
 
+@app.get("/api/token/{key}")
+async def create_stream_token(key: str):
+    """視聴ページが WebSocket 接続前に取得するワンタイムトークン。"""
+    if not _KEY_RE.match(key):
+        raise HTTPException(400, "無効なストリームキーです。")
+    return {"token": _create_token(key), "ttl": _TOKEN_TTL}
+
+
+# ─── WebSocket: ポータル用 ────────────────────────────────────────────────────
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    """ngrok RTMP URL とセッション数をリアルタイムでプッシュする。"""
     await ws.accept()
     _ws_clients.add(ws)
     try:
         await ws.send_text(json.dumps(await _current_status(), ensure_ascii=False))
         while True:
-            # Cloudflare Tunnel の idle タイムアウト対策に定期 ping
             await asyncio.sleep(30)
             await ws.send_text(json.dumps({"ping": True}))
     except (WebSocketDisconnect, Exception):
@@ -418,6 +521,115 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         _ws_clients.discard(ws)
 
+
+# ─── WebSocket: LL-HLS プレイリストプッシュ ───────────────────────────────────
+
+@app.websocket("/ws/hls/{key}")
+async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
+    """
+    認証済み WebSocket でプレイリストをリアルタイムプッシュする。
+    - 接続時に master + 現在の variant を即時送信
+    - mediamtx が index.m3u8 を更新するたびにセグメント署名済みプレイリストをプッシュ
+    - 切断でセッションを即解放
+    """
+    if not _KEY_RE.match(key):
+        await ws.close(1008, "Invalid key")
+        return
+    if not _consume_token(token, key):
+        await ws.close(1008, "Invalid or expired token")
+        return
+
+    try:
+        sid = await _acquire_session(None)
+    except HTTPException:
+        await ws.close(1013, "満員です")
+        return
+
+    await ws.accept()
+
+    high_rel = f"live/{key}/index.m3u8"
+    low_rel  = f"live/{key}_transcode/index.m3u8"
+    q: asyncio.Queue[str] = asyncio.Queue(maxsize=30)
+
+    async with _ws_hls_lock:
+        _ws_hls_queues[high_rel].append(q)
+        _ws_hls_queues[low_rel].append(q)
+
+    async def _push_variant(variant: str, rel: str, vkey: str) -> None:
+        fp = HLS_DIR / rel
+        if not fp.exists():
+            return
+        try:
+            async with aiofiles.open(fp, encoding="utf-8") as f:
+                content = await f.read()
+            content = _patch_playlist(content)
+            content = _sign_playlist_segments(content, vkey)
+            await ws.send_json({"type": "level", "variant": variant, "content": content})
+        except OSError:
+            pass
+
+    try:
+        await ws.send_json({"type": "master", "content": _build_master_content(key)})
+        await _push_variant("high", high_rel, key)
+        await _push_variant("low",  low_rel,  f"{key}_transcode")
+
+        while True:
+            try:
+                changed_rel = await asyncio.wait_for(q.get(), timeout=25.0)
+            except asyncio.TimeoutError:
+                await ws.send_json({"type": "ping"})
+                if not await _renew_session(sid):
+                    break
+                continue
+
+            await _renew_session(sid)
+            if changed_rel == high_rel:
+                await _push_variant("high", high_rel, key)
+            else:
+                await _push_variant("low", low_rel, f"{key}_transcode")
+
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        async with _ws_hls_lock:
+            for rel in (high_rel, low_rel):
+                try:
+                    _ws_hls_queues[rel].remove(q)
+                except ValueError:
+                    pass
+        await _revoke_session(sid)
+
+
+# ─── セグメント配信 (署名付き短命 URL) ───────────────────────────────────────
+
+@app.get("/seg/{path:path}")
+async def serve_segment(
+    path: str,
+    exp:  str = Query(...),
+    sig:  str = Query(...),
+):
+    """HMAC 署名を検証してセグメントを配信する。署名は _SEGMENT_TTL 秒で失効。"""
+    if not _verify_segment(path, exp, sig):
+        raise HTTPException(403, "URL の有効期限が切れています。再生を再開してください。")
+
+    file_path = HLS_DIR / path
+    try:
+        file_path.resolve().relative_to(HLS_DIR.resolve())
+    except ValueError:
+        raise HTTPException(400, "Invalid path")
+
+    if not file_path.exists():
+        raise HTTPException(404, "Not found")
+
+    media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
+    seg_headers = {
+        "Cache-Control": f"private, max-age={_SEGMENT_TTL}",
+        "Access-Control-Allow-Origin": "*",
+    }
+    return FileResponse(file_path, media_type=media_type, headers=seg_headers)
+
+
+# ─── HLS 配信 (VRChat 向け HTTP 経由) ────────────────────────────────────────
 
 @app.get("/hls/{path:path}")
 async def serve_hls(
@@ -430,12 +642,37 @@ async def serve_hls(
     is_master   = path.endswith("master.m3u8")
     is_playlist = path.endswith("index.m3u8")
 
-    # パストラバーサル防止: resolve() で ".." を展開してから比較する。
-    # relative_to() のみでは "/hls/../../etc/passwd" が ValueError を投げないため不十分。
     try:
         file_path.resolve().relative_to(HLS_DIR.resolve())
     except ValueError:
         raise HTTPException(400, "Invalid path")
+
+    # live/{key}/master.m3u8 は動的生成 (mediamtx は書き出さない)
+    path_parts = path.split("/")
+    if (is_master
+            and len(path_parts) == 3
+            and path_parts[0] == "live"
+            and path_parts[2] == "master.m3u8"
+            and not path_parts[1].endswith("_transcode")):
+        key = path_parts[1]
+        if not _KEY_RE.match(key):
+            raise HTTPException(400, "無効なストリームキーです。")
+        sid = await _acquire_session(sid)
+        master_content = (
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:6\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high\n"
+            "index.m3u8\n"
+            f"#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low\n"
+            f"../{key}_transcode/index.m3u8\n"
+        )
+        if sid:
+            master_content = _inject_sid(master_content, sid)
+        return Response(
+            content=master_content.encode("utf-8"),
+            media_type="application/vnd.apple.mpegurl",
+            headers=NO_CACHE_HEADERS,
+        )
 
     if is_master:
         sid = await _acquire_session(sid)
@@ -565,13 +802,11 @@ input.empty{color:#484f58}
 
 </main>
 <script>
-// ─── 状態 ───────────────────────────────────────────────────────────────────
 let siteBase = '';
 let ws = null;
 let reconnectTimer = null;
 let pollTimer = null;
 
-// ─── UI ヘルパー ─────────────────────────────────────────────────────────────
 function setVal(id, val, empty) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -596,7 +831,6 @@ function applyCapacity(active, max) {
   el.style.color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
 }
 
-// ─── REST フォールバック ─────────────────────────────────────────────────────
 async function fetchFromRest() {
   try {
     const r = await fetch('/api/ngrok');
@@ -608,39 +842,28 @@ async function fetchFromRest() {
   } catch {}
 }
 
-// ─── WebSocket ───────────────────────────────────────────────────────────────
 function connectWS() {
   clearTimeout(reconnectTimer);
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
-
-  ws.onopen = () => {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  };
-
+  ws.onopen = () => { clearInterval(pollTimer); pollTimer = null; };
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.ping) return;
     if ('rtmp' in d || 'site' in d) applyNgrokData(d);
     if (d.sessions) applyCapacity(d.sessions.active, d.sessions.max);
   };
-
   ws.onclose = () => {
     ws = null;
     if (!pollTimer) pollTimer = setInterval(fetchFromRest, 10000);
     reconnectTimer = setTimeout(connectWS, 5000);
   };
-
   ws.onerror = () => ws && ws.close();
 }
 
-// ─── 初期化 ─────────────────────────────────────────────────────────────────
-// ページ読み込み直後に REST で即座取得し、WebSocket も並行接続
 fetchFromRest();
 connectWS();
 
-// ─── コピー / 開く ───────────────────────────────────────────────────────────
 function cp(id, btn) {
   const el = document.getElementById(id);
   if (!el || el.classList.contains('empty')) return;
@@ -656,12 +879,10 @@ function openWatch() {
   if (el && !el.classList.contains('empty')) window.open(el.value, '_blank');
 }
 
-// ─── ストリーム確認 ──────────────────────────────────────────────────────────
 async function checkStream() {
   const key = document.getElementById('key-input').value.trim();
   if (!key) return;
   document.getElementById('stream-result').style.display = 'block';
-
   try {
     const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
     if (!r.ok) { showStatus(false, '無効なキーです'); return; }
@@ -700,7 +921,7 @@ _WATCH_HTML = """\
 html,body{width:100%;height:100%;background:#000;overflow:hidden}
 #wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
 video{width:100%;height:100%;object-fit:contain}
-#msg{position:absolute;color:#484f58;font-family:'Segoe UI',system-ui,sans-serif;font-size:.9rem;pointer-events:none}
+#msg{position:absolute;color:#484f58;font-family:'Segoe UI',system-ui,sans-serif;font-size:.9rem;pointer-events:none;text-align:center;padding:8px}
 </style>
 </head>
 <body>
@@ -711,60 +932,219 @@ video{width:100%;height:100%;object-fit:contain}
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <script>
 const KEY = __KEY_JSON__;
-const HLS_URL = `/hls/live/${KEY}/master.m3u8`;
-let hls = null;
-let polling = null;
 
-function startPlayer() {
+// ─── WebSocket HLS 共有状態 ───────────────────────────────────────────────────
+const _ws = {
+  conn:         null,
+  master:       null,         // master content string | null
+  masterWaiters: [],          // [resolve fn]
+  levels:       {},           // 'high'|'low' → content string
+  levelWaiters: {},           // 'high'|'low' → [{msn,part,resolve,timer}]
+};
+
+// ─── LL-HLS ユーティリティ ────────────────────────────────────────────────────
+function _parseMsn(url) {
+  try {
+    const u = new URL(url, location.href);
+    const msn  = u.searchParams.get('_HLS_msn');
+    const part = u.searchParams.get('_HLS_part');
+    return {
+      msn:  msn  !== null ? parseInt(msn,  10) : null,
+      part: part !== null ? parseInt(part, 10) : null,
+    };
+  } catch { return { msn: null, part: null }; }
+}
+
+function _hlsSatisfies(content, msn, part) {
+  if (msn === null) return true;
+  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+  if (!seqM) return false;
+  const base  = parseInt(seqM[1], 10);
+  const segs  = (content.match(/#EXTINF:/g) || []).length;
+  const maxMsn = base + segs - 1;
+  if (msn < maxMsn) return true;   // 完了済みセグメント
+  if (msn > maxMsn + 1) return false;
+  if (part === null) return msn <= maxMsn;
+  // 末尾の partial セグメントのパーツ数を数える
+  const lastInfPos = content.lastIndexOf('#EXTINF:');
+  let tail = content;
+  if (lastInfPos >= 0) {
+    const nl1 = content.indexOf('\\n', lastInfPos);
+    const nl2 = content.indexOf('\\n', nl1 + 1);
+    tail = content.slice(nl2 + 1);
+  }
+  return (tail.match(/#EXT-X-PART:/g) || []).length > part;
+}
+
+function _deliverLevel(variant, content) {
+  _ws.levels[variant] = content;
+  const pending = (_ws.levelWaiters[variant] || []).splice(0);
+  const remaining = [];
+  for (const req of pending) {
+    if (_hlsSatisfies(content, req.msn, req.part)) {
+      clearTimeout(req.timer);
+      req.resolve(content);
+    } else {
+      remaining.push(req);
+    }
+  }
+  _ws.levelWaiters[variant] = remaining;
+}
+
+// ─── カスタム pLoader (プレイリストを WebSocket から受け取る) ─────────────────
+class WsPlaylistLoader {
+  constructor(_config) {
+    this._aborted = false;
+    this._pending = null;
+  }
+
+  load(ctx, config, callbacks) {
+    this._aborted = false;
+
+    const deliver = (content) => {
+      if (this._aborted) return;
+      const t = performance.now();
+      callbacks.onSuccess({ data: content, url: ctx.url },
+        { trequest: t, tfirst: t, tload: t }, ctx);
+    };
+
+    if (ctx.type === 'manifest') {
+      if (_ws.master !== null) { setTimeout(() => deliver(_ws.master), 0); return; }
+      _ws.masterWaiters.push(deliver);
+      return;
+    }
+
+    if (ctx.type === 'level') {
+      const variant = ctx.url.includes('_transcode') ? 'low' : 'high';
+      const { msn, part } = _parseMsn(ctx.url);
+      const latest = _ws.levels[variant];
+      if (latest !== undefined && _hlsSatisfies(latest, msn, part)) {
+        setTimeout(() => deliver(latest), 0);
+        return;
+      }
+      const timer = setTimeout(() => {
+        this._removePending();
+        callbacks.onTimeout({}, { trequest: performance.now(), tfirst: 0, tload: 0 }, ctx);
+      }, config.timeout || 10000);
+      this._pending = { variant, msn, part, resolve: deliver, timer };
+      if (!_ws.levelWaiters[variant]) _ws.levelWaiters[variant] = [];
+      _ws.levelWaiters[variant].push(this._pending);
+      return;
+    }
+  }
+
+  _removePending() {
+    if (!this._pending) return;
+    const list = _ws.levelWaiters[this._pending.variant] || [];
+    const idx = list.indexOf(this._pending);
+    if (idx >= 0) list.splice(idx, 1);
+    this._pending = null;
+  }
+
+  abort() {
+    this._aborted = true;
+    if (this._pending) { clearTimeout(this._pending.timer); this._removePending(); }
+  }
+
+  destroy() { this.abort(); }
+}
+
+// ─── プレイヤー制御 ───────────────────────────────────────────────────────────
+let _hls     = null;
+let _hlsUp   = false;
+let _retryTm = null;
+let _pollTm  = null;
+
+function _msg(text) { document.getElementById('msg').style.display = text ? '' : 'none';
+                      document.getElementById('msg').textContent   = text || ''; }
+
+function _startHls() {
+  if (_hlsUp) return;
+  _hlsUp = true;
+  clearInterval(_pollTm); _pollTm = null;
+  _msg(null);
+
   const video = document.getElementById('v');
-  document.getElementById('msg').style.display = 'none';
-  if (hls) { hls.destroy(); hls = null; }
-  if (Hls.isSupported()) {
-    hls = new Hls({
-      lowLatencyMode: true,
-      backBufferLength: 2,
-      maxBufferLength: 4,
-      liveSyncDurationCount: 2,
-      liveMaxLatencyDurationCount: 5,
-      liveDurationInfinity: true,
-    });
-    hls.loadSource(HLS_URL);
-    hls.attachMedia(video);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-    hls.on(Hls.Events.ERROR, (_, d) => {
-      if (d.fatal) { hls.destroy(); hls = null; startPolling(); }
-    });
-  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = HLS_URL;
-    video.play().catch(() => {});
+  if (_hls) _hls.destroy();
+  _hls = new Hls({
+    lowLatencyMode:             true,
+    backBufferLength:           2,
+    maxBufferLength:            4,
+    liveSyncDurationCount:      1,
+    liveMaxLatencyDurationCount: 3,
+    liveDurationInfinity:       true,
+    pLoader:                    WsPlaylistLoader,
+  });
+  _hls.loadSource(`/hls/live/${KEY}/master.m3u8`);
+  _hls.attachMedia(video);
+  _hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+  _hls.on(Hls.Events.ERROR, (_, d) => {
+    if (d.fatal) { _hls.destroy(); _hls = null; _hlsUp = false; _reconnect(); }
+  });
+}
+
+function _resetWsState() {
+  _ws.master = null;
+  _ws.masterWaiters.length = 0;
+  _ws.levels = {};
+  for (const list of Object.values(_ws.levelWaiters)) {
+    for (const r of list.splice(0)) clearTimeout(r.timer);
   }
 }
 
-async function checkActive() {
+function _reconnect() {
+  if (_hls) { _hls.destroy(); _hls = null; _hlsUp = false; }
+  _resetWsState();
+  clearTimeout(_retryTm);
+  _retryTm = setTimeout(_initWs, 3000);
+}
+
+// ─── WebSocket 接続 ───────────────────────────────────────────────────────────
+async function _initWs() {
+  let token;
   try {
-    const r = await fetch(`/api/stream/${encodeURIComponent(KEY)}`);
-    if (!r.ok) return false;
-    return (await r.json()).active;
-  } catch { return false; }
-}
+    const r = await fetch(`/api/token/${encodeURIComponent(KEY)}`);
+    if (!r.ok) throw new Error();
+    token = (await r.json()).token;
+  } catch { _msg('接続中...'); _reconnect(); return; }
 
-function startPolling() {
-  document.getElementById('msg').style.display = '';
-  if (polling) return;
-  polling = setInterval(async () => {
-    if (await checkActive()) {
-      clearInterval(polling);
-      polling = null;
-      startPlayer();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(
+    `${proto}//${location.host}/ws/hls/${encodeURIComponent(KEY)}?token=${encodeURIComponent(token)}`
+  );
+  _ws.conn = ws;
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'ping') return;
+    if (msg.type === 'master') {
+      _ws.master = msg.content;
+      for (const fn of _ws.masterWaiters.splice(0)) fn(msg.content);
+      if (!_hlsUp) _startHls();
     }
-  }, 3000);
+    if (msg.type === 'level') _deliverLevel(msg.variant, msg.content);
+  };
+
+  ws.onclose = () => { _ws.conn = null; _reconnect(); };
+  ws.onerror = () => ws.close();
 }
 
+// ─── 起動 ────────────────────────────────────────────────────────────────────
 (async () => {
-  if (await checkActive()) {
-    startPlayer();
+  async function isActive() {
+    try {
+      const r = await fetch(`/api/stream/${encodeURIComponent(KEY)}`);
+      return r.ok && (await r.json()).active;
+    } catch { return false; }
+  }
+
+  if (await isActive()) {
+    _initWs();
   } else {
-    startPolling();
+    _msg('配信待機中...');
+    _pollTm = setInterval(async () => {
+      if (await isActive()) { clearInterval(_pollTm); _pollTm = null; _initWs(); }
+    }, 3000);
   }
 })();
 </script>
@@ -780,7 +1160,6 @@ async def portal():
 
 @app.get("/watch/{key}", response_class=HTMLResponse)
 async def watch_page(key: str):
-    """ストリームキーを知る視聴者向けプレイヤーページ。"""
     if not _KEY_RE.match(key):
         raise HTTPException(400, "無効なストリームキーです。")
     return _WATCH_HTML.replace("__KEY_JSON__", json.dumps(key))

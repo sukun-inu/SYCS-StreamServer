@@ -3,38 +3,25 @@ ARG CUDA_VERSION=12.6.3-runtime-ubuntu24.04
 # ── Stage 1: mediamtx バイナリ取得 ───────────────────────────────────────────
 FROM bluenviron/mediamtx:latest AS mediamtx
 
-# ── Stage 2: mwader/static-ffmpeg ────────────────────────────────────────────
-# Docker multi-stage 専用の static build。LL-HLS (hls_part_duration) 対応済み。
-# /ffmpeg, /ffprobe が置かれている。
-FROM mwader/static-ffmpeg:latest AS ffmpeg-static
-
-# ── Stage 3: 実行イメージ ─────────────────────────────────────────────────────
+# ── Stage 2: 実行イメージ ─────────────────────────────────────────────────────
 FROM nvidia/cuda:${CUDA_VERSION}
 ARG DEBIAN_FRONTEND=noninteractive
 
-COPY --from=mediamtx      /mediamtx                /usr/local/bin/mediamtx
-COPY --from=ffmpeg-static /ffmpeg  /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-static /ffprobe /usr/local/bin/ffprobe
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 
-# ビルド時にLL-HLS対応を確認: 実際に -hls_part_duration を渡してエラーが出ないかテスト
-RUN ffmpeg -version 2>&1 | head -1 \
+# FFmpeg は apt で入れる。LL-HLS セグメント生成は mediamtx が担当するため
+# hls_part_duration 不要。RTMP トランスコード (libx264 / h264_nvenc) のみ使用。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# ビルド時に FFmpeg の最低限の動作を確認
+RUN ffmpeg -version 2>&1 | grep -q "ffmpeg version" \
     && ffmpeg -encoders 2>&1 | grep -q "libx264" \
-        || { echo "FAIL: libx264 encoder missing"; exit 1; } \
-    && mkdir -p /tmp/hls_test \
-    && ffmpeg -v error \
-        -f lavfi -i "color=c=black:s=320x240:r=30" -t 1 \
-        -c:v libx264 -preset ultrafast \
-        -f hls \
-        -hls_time 1 \
-        -hls_part_duration 0.2 \
-        -hls_segment_type fmp4 \
-        -hls_fmp4_init_filename "init.mp4" \
-        /tmp/hls_test/test.m3u8 \
-        || { echo "FAIL: hls_part_duration not accepted (LL-HLS unavailable)"; exit 1; } \
-    && rm -rf /tmp/hls_test \
-    && echo "[dockerfile] FFmpeg OK — LL-HLS (hls_part_duration) confirmed"
+    && ffmpeg -protocols 2>&1 | grep -q "rtmp" \
+    && echo "[dockerfile] FFmpeg OK — libx264 + RTMP confirmed"
 
-RUN mkdir -p /etc/mediamtx /hls/live
+RUN mkdir -p /etc/mediamtx /hls
 COPY mediamtx.yml  /etc/mediamtx/mediamtx.yml
 COPY publish.sh    /usr/local/bin/publish.sh
 COPY entrypoint.sh /entrypoint.sh

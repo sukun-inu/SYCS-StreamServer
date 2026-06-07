@@ -46,7 +46,7 @@ function _parseMsn(url) {
 
 function _hlsSatisfies(content, msn, part) {
   if (msn === null) return true;
-  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\\d+)/);
+  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
   if (!seqM) return false;
   const base   = parseInt(seqM[1], 10);
   const segs   = (content.match(/#EXTINF:/g) || []).length;
@@ -59,8 +59,8 @@ function _hlsSatisfies(content, msn, part) {
   const lastInfPos = content.lastIndexOf('#EXTINF:');
   let tail = content;
   if (lastInfPos >= 0) {
-    const nl1 = content.indexOf('\\n', lastInfPos);
-    const nl2 = nl1 >= 0 ? content.indexOf('\\n', nl1 + 1) : -1;
+    const nl1 = content.indexOf('\n', lastInfPos);
+    const nl2 = nl1 >= 0 ? content.indexOf('\n', nl1 + 1) : -1;
     tail = content.slice(nl2 + 1);
   }
   return (tail.match(/#EXT-X-PART:/g) || []).length > part;

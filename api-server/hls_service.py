@@ -422,27 +422,47 @@ class HlsService:
         return "".join(out)
 
     def inject_sid(self, content: str, sid: str) -> str:
-        content = re.sub(r'(URI="[^"?]+)"', rf'\1?sid={sid}"', content)
+        def with_sid(uri: str) -> str:
+            if uri.startswith(("http://", "https://")) or re.search(r"([?&])sid=", uri):
+                return uri
+            sep = "&" if "?" in uri else "?"
+            return f"{uri}{sep}sid={sid}"
+
+        content = re.sub(r'URI="([^"]+)"', lambda m: f'URI="{with_sid(m.group(1))}"', content)
         out: list[str] = []
         for line in content.splitlines(keepends=True):
             tag = line.rstrip("\r\n")
-            if tag and not tag.startswith("#") and "?" not in tag:
-                out.append(f"{tag}?sid={sid}\n")
+            if tag and not tag.startswith("#"):
+                out.append(with_sid(tag) + "\n")
             else:
                 out.append(line)
         return "".join(out)
 
-    def sign_segment_url(self, rel_path: str) -> str:
+    def sign_segment_url(self, rel_path: str, source_query: str = "") -> str:
         exp = int(time.time()) + SEGMENT_TTL
-        mac = hmac.new(SEGMENT_SECRET, f"{rel_path}:{exp}".encode(), hashlib.sha256)
+        source_query = source_query.lstrip("?")
+        mac = hmac.new(
+            SEGMENT_SECRET,
+            self._segment_sig_payload(rel_path, exp, source_query).encode(),
+            hashlib.sha256,
+        )
         sig = mac.hexdigest()[:16]
-        return f"/seg/{rel_path}?exp={exp}&sig={sig}"
+        url = f"/seg/{rel_path}?exp={exp}&sig={sig}"
+        if source_query:
+            url += f"&src={quote(source_query, safe='-_.~')}"
+        return url
 
-    def verify_segment(self, rel_path: str, exp: str, sig: str) -> bool:
+    def verify_segment(self, rel_path: str, exp: str, sig: str, source_query: str = "") -> bool:
         try:
-            if int(exp) < time.time():
+            exp_int = int(exp)
+            if exp_int < time.time():
                 return False
-            mac = hmac.new(SEGMENT_SECRET, f"{rel_path}:{exp}".encode(), hashlib.sha256)
+            source_query = source_query.lstrip("?")
+            mac = hmac.new(
+                SEGMENT_SECRET,
+                self._segment_sig_payload(rel_path, exp_int, source_query).encode(),
+                hashlib.sha256,
+            )
             return hmac.compare_digest(mac.hexdigest()[:16], sig)
         except Exception:
             return False
@@ -453,10 +473,11 @@ class HlsService:
 
         def sign_uri(match: re.Match) -> str:
             uri = match.group(1)
-            rel_path = self.segment_rel_path(base_rel_dir, uri)
-            if rel_path is None:
+            segment = self.segment_rel_url(base_rel_dir, uri)
+            if segment is None:
                 return match.group(0)
-            return f'URI="{self.sign_segment_url(rel_path)}"'
+            rel_path, source_query = segment
+            return f'URI="{self.sign_segment_url(rel_path, source_query)}"'
 
         out: list[str] = []
         for line in content.splitlines(keepends=True):
@@ -465,8 +486,12 @@ class HlsService:
                 out.append(re.sub(r'URI="([^"]+)"', sign_uri, line))
                 continue
             if tag and not tag.startswith("#") and not tag.startswith(("/", "http")):
-                rel_path = self.segment_rel_path(base_rel_dir, tag)
-                out.append((self.sign_segment_url(rel_path) if rel_path else tag) + "\n")
+                segment = self.segment_rel_url(base_rel_dir, tag)
+                if segment is None:
+                    out.append(tag + "\n")
+                else:
+                    rel_path, source_query = segment
+                    out.append(self.sign_segment_url(rel_path, source_query) + "\n")
             else:
                 out.append(line)
         return "".join(out)
@@ -552,12 +577,20 @@ class HlsService:
         return self._unique_safe_rel_paths([preferred, *candidates])
 
     def segment_rel_path(self, base_rel_dir: str, uri: str) -> str | None:
-        uri_path = uri.split("?", 1)[0].split("#", 1)[0].strip()
-        if not uri_path or uri_path.startswith(("http://", "https://", "/", "../")):
+        segment = self.segment_rel_url(base_rel_dir, uri)
+        return segment[0] if segment is not None else None
+
+    def segment_rel_url(self, base_rel_dir: str, uri: str) -> tuple[str, str] | None:
+        uri = uri.split("#", 1)[0].strip()
+        if not uri or uri.startswith(("http://", "https://", "/", "../")):
             return None
-        while uri_path.startswith("./"):
-            uri_path = uri_path[2:]
-        return self._normalize_rel_path(f"{base_rel_dir}/{uri_path}")
+        while uri.startswith("./"):
+            uri = uri[2:]
+        uri_path, source_query = self._split_rel_url(uri)
+        rel_path = self._normalize_rel_path(posixpath.normpath(f"{base_rel_dir}/{uri_path}"))
+        if not rel_path or rel_path.startswith("../") or "/../" in rel_path:
+            return None
+        return rel_path, source_query
 
     async def _fetch_first_mediamtx(
         self,
@@ -829,6 +862,9 @@ class HlsService:
         rel_url = self._normalize_rel_path(rel_url).split("#", 1)[0]
         path, sep, query = rel_url.partition("?")
         return path, query if sep else ""
+
+    def _segment_sig_payload(self, rel_path: str, exp: int, source_query: str = "") -> str:
+        return f"{rel_path}:{source_query}:{exp}" if source_query else f"{rel_path}:{exp}"
 
     def _is_media_playlist(self, content: str) -> bool:
         return "#EXT-X-MEDIA-SEQUENCE:" in content or "#EXTINF:" in content

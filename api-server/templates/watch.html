@@ -21,6 +21,7 @@ video{width:100%;height:100%;object-fit:contain}
 <script>
 const KEY = __KEY_JSON__;
 const RETRY_MS = 3000;
+const PLAYLIST_TRANSPORT = 'http';
 
 // ─── WebSocket HLS 共有状態 ───────────────────────────────────────────────────
 const _ws = {
@@ -196,7 +197,7 @@ function _startHls() {
 
   const video = document.getElementById('v');
   if (_hls) _hls.destroy();
-  _hls = new Hls({
+  const config = {
     lowLatencyMode:             true,
     backBufferLength:           2,
     maxBufferLength:            4,
@@ -204,8 +205,9 @@ function _startHls() {
     liveMaxLatencyDurationCount: 3,
     maxLiveSyncPlaybackRate:    1.2,
     liveDurationInfinity:       true,
-    pLoader:                    WsPlaylistLoader,
-  });
+  };
+  if (PLAYLIST_TRANSPORT === 'ws') config.pLoader = WsPlaylistLoader;
+  _hls = new Hls(config);
   _hls.loadSource(`/hls/live/${KEY}/master.m3u8`);
   _hls.attachMedia(video);
   _hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
@@ -243,7 +245,7 @@ function _reconnect(message = '接続中...') {
   _resetWsState();
   _msg(message);
   clearTimeout(_retryTm);
-  _retryTm = setTimeout(_initWs, RETRY_MS);
+  _retryTm = setTimeout(PLAYLIST_TRANSPORT === 'ws' ? _initWs : _startHls, RETRY_MS);
 }
 
 function _stopPolling() {
@@ -304,7 +306,8 @@ async function _initWs() {
   }
 
   if (await isActive()) {
-    _initWs();
+    if (PLAYLIST_TRANSPORT === 'ws') _initWs();
+    else _startHls();
   } else {
     _msg('配信待機中...');
     const poll = async () => {
@@ -314,7 +317,8 @@ async function _initWs() {
       _polling = false;
       if (active) {
         _stopPolling();
-        _initWs();
+        if (PLAYLIST_TRANSPORT === 'ws') _initWs();
+        else _startHls();
         return;
       }
       _pollTm = setTimeout(poll, 3000);

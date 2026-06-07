@@ -13,9 +13,10 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import urlencode
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
@@ -265,8 +266,9 @@ async def serve_segment(
     path: str,
     exp: str = Query(...),
     sig: str = Query(...),
+    src: str = Query(default=""),
 ):
-    if not hls.verify_segment(path, exp, sig):
+    if not hls.verify_segment(path, exp, sig, src):
         raise HTTPException(403, "URL の有効期限が切れています。再生を再開してください。")
 
     file_path = HLS_DIR / path
@@ -278,9 +280,12 @@ async def serve_segment(
         "Access-Control-Allow-Origin": "*",
     }
 
-    disk_path = await hls.wait_for_existing_file(path)
+    disk_path = hls.find_existing_file(path)
+    if disk_path is None and not (src or path.endswith("_init.mp4")):
+        disk_path = await hls.wait_for_existing_file(path)
     if disk_path is None:
-        data = await hls.fetch_mediamtx_hls(path)
+        source_path = f"{path}?{src}" if src else path
+        data = await hls.fetch_mediamtx_hls(source_path)
         if data is None:
             raise HTTPException(404, "Not found")
         return Response(content=data, media_type=media_type, headers=headers)
@@ -290,6 +295,7 @@ async def serve_segment(
 
 @app.get("/hls/{path:path}")
 async def serve_hls(
+    request: Request,
     path: str,
     sid: str | None = Query(default=None),
     _HLS_msn: int | None = Query(default=None),
@@ -337,9 +343,13 @@ async def serve_hls(
             content = hls.inject_sid(content, sid)
         return _playlist_response(content)
 
-    disk_path = await hls.wait_for_existing_file(path)
+    source_query = _forward_source_query(request)
+    disk_path = hls.find_existing_file(path)
+    if disk_path is None and not (source_query or path.endswith("_init.mp4")):
+        disk_path = await hls.wait_for_existing_file(path)
     if disk_path is None:
-        data = await hls.fetch_mediamtx_hls(path)
+        source_path = f"{path}?{source_query}" if source_query else path
+        data = await hls.fetch_mediamtx_hls(source_path)
         if data is None:
             raise HTTPException(404, "Not found")
         if sid and not sessions.check_and_record_bw(sid, len(data)):
@@ -379,6 +389,12 @@ def _dynamic_master_key(path: str) -> str | None:
     ):
         return path_parts[1]
     return None
+
+
+def _forward_source_query(request: Request) -> str:
+    ignored = {"sid", "_HLS_msn", "_HLS_part"}
+    pairs = [(key, value) for key, value in request.query_params.multi_items() if key not in ignored]
+    return urlencode(pairs)
 
 
 def _playlist_response(content: str) -> Response:

@@ -4,12 +4,20 @@
 
 STREAM_NAME="${MTX_PATH##*/}"
 if [ -z "${STREAM_NAME}" ]; then
-    echo "$(date -u +%FT%TZ) [publish-error] MTX_PATH が未設定または不正: MTX_PATH='${MTX_PATH}'" >&2
+    echo "$(date -u +%FT%TZ) [publish-error] MTX_PATH 未設定または不正: '${MTX_PATH}'" >&2
     exit 1
 fi
 
-set -e
+# 同一ストリームキーの並列起動を防止 (OBS 瞬断→再接続時に runOnReadyRestart が
+# 旧プロセスの終了前に新プロセスを起動することがあるため)
+LOCK="/tmp/publish_${STREAM_NAME}.lock"
+exec 9>"${LOCK}"
+if ! flock -n 9; then
+    echo "$(date -u +%FT%TZ) [publish] ${STREAM_NAME} already running, exit" >&2
+    exit 0
+fi
 
+set -e
 LOG="/tmp/publish_${STREAM_NAME}.log"
 exec >>"${LOG}" 2>&1
 echo "[publish:$$] $(date -u +%FT%TZ) start key=${STREAM_NAME} MTX_PATH=${MTX_PATH}"
@@ -24,15 +32,21 @@ HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 OUTPUT_DIR="/hls/live/${STREAM_NAME}"
 mkdir -p "${OUTPUT_DIR}/high" "${OUTPUT_DIR}/low"
 
+PID=""
 FFMPEG_EXIT=0
 
 cleanup() {
     trap - EXIT TERM INT HUP
     [ -n "${PID}" ] && kill "${PID}" 2>/dev/null
-    wait 2>/dev/null
+    wait "${PID}" 2>/dev/null || true
+    flock -u 9 2>/dev/null || true
     exit "${FFMPEG_EXIT}"
 }
 trap cleanup EXIT TERM INT HUP
+
+# RTMP loop-back より信頼性の高い RTSP (TCP) で読む。
+# runOnReady 発火時点で mediamtx は既にストリームを RTSP で提供できる状態にある。
+INPUT="rtsp://127.0.0.1:8554/${MTX_PATH}"
 
 vbr_params() {
     local n="${1%k}"
@@ -61,9 +75,8 @@ fi
 
 ffmpeg \
     -loglevel warning \
-    -fflags +genpts \
-    -use_wallclock_as_timestamps 1 \
-    -i "rtmp://127.0.0.1:1935/${MTX_PATH}" \
+    -rtsp_transport tcp \
+    -i "${INPUT}" \
     -filter_complex "[0:v]split=2[vh][vl];[vl]scale=-2:720[vls]" \
     -map "[vh]"  -map 0:a \
     -map "[vls]" -map 0:a \

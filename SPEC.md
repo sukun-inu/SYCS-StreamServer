@@ -39,8 +39,8 @@
 
 | 項目 | 内容 |
 |------|------|
-| ベースイメージ | `nvidia/cuda:${CUDA_VERSION}` (デフォルト: `12.3.1-runtime-ubuntu22.04`) |
-| ビルド方式 | マルチステージ: `bluenviron/mediamtx:latest` からバイナリをコピー |
+| ベースイメージ | `nvidia/cuda:${CUDA_VERSION}` (デフォルト: `12.6.3-runtime-ubuntu24.04`) |
+| ビルド方式 | マルチステージ: `bluenviron/mediamtx:latest` からバイナリをコピー、FFmpeg は `ubuntu:24.04` でソースビルド |
 | プロセス | mediamtx + publish.sh (FFmpeg サブプロセス) |
 | 役割 | RTMP 受信、FFmpeg 起動管理、2バリアント HLS 生成 |
 | GPU アクセス | `deploy.resources.reservations.devices` (NVIDIA) |
@@ -51,18 +51,18 @@
 
 ```
 OBS (publisher)
-    │ rtmp://host:1935/live  (ストリームキーは任意)
+    │ rtmp://host:1935/live  (ストリームキー = 出力ディレクトリ名)
     ▼
 mediamtx
-    │ runOnPublish → publish.sh  (MTX_PATH="live/anything" → STREAM_NAME="live")
+    │ runOnReady → publish.sh  (MTX_PATH="live/{stream_key}" → STREAM_NAME="{stream_key}")
     │
     └── FFmpeg (filter_complex split)
-         ├── /hls/live/master.m3u8   ← ABR マスター (high/low 両バリアント列挙)
-         ├── /hls/live/high/         元解像度 VBR avg VIDEO_BITRATE
+         ├── /hls/live/{stream_key}/master.m3u8   ← ABR マスター (high/low 両バリアント列挙)
+         ├── /hls/live/{stream_key}/high/          元解像度 VBR avg VIDEO_BITRATE
          │    ├── index.m3u8  (EXT-X-PART 付き LL-HLS)
          │    ├── init_high.mp4
          │    └── seg*.m4s
-         └── /hls/live/low/          720p VBR avg VIDEO_BITRATE_LOW
+         └── /hls/live/{stream_key}/low/           720p VBR avg VIDEO_BITRATE_LOW
               ├── index.m3u8
               ├── init_low.mp4
               └── seg*.m4s
@@ -70,16 +70,30 @@ mediamtx
 
 **mediamtx → publish.sh の連携:**
 
-mediamtx は `runOnPublish` フックを環境変数で呼び出す。  
+mediamtx は `runOnReady` フックを環境変数で呼び出す。  
 `exec_push` の引数渡し問題を回避し、ストリーム名を確実に渡せる。
 
 ```
 MTX_PATH="live/kawasaki"  (OBS のアプリ名/ストリームキー)
-            ↓ publish.sh: STREAM_NAME="${MTX_PATH%%/*}"
-STREAM_NAME="live"        (先頭コンポーネント = RTMP アプリ名)
+            ↓ publish.sh: STREAM_NAME="${MTX_PATH##*/}"
+STREAM_NAME="kawasaki"    (末尾コンポーネント = ストリームキー)
 ```
 
-OBS のストリームキーはパスに影響しない。RTMP アプリ名 (`/live`) のみが使われる。
+OBS のストリームキーが HLS 出力先サブディレクトリ名になる。  
+ポータルで視聴 URL を生成する際は OBS で設定したキーと同じ値を入力する。
+
+**FFmpeg 入力プロトコル: RTMP → RTSP (TCP)**
+
+publish.sh は mediamtx の RTSP エンドポイントからストリームを読む。  
+RTMP loop-back と比較して RTSP/TCP は以下の点で信頼性が高い:
+
+| 問題 | RTMP loop-back | RTSP (TCP) |
+|------|---------------|------------|
+| 並列インスタンス | flock で防止 | flock で防止 |
+| 接続タイミング | runOnReady 直後に競合あり | mediamtx が RTSP で即座に提供可能 |
+| 再接続 | RTMP クライアントの reconnect 依存 | TCP レイヤで安定 |
+
+publish.sh は `flock` で排他制御を行い、OBS 瞬断→再接続時の二重起動を防ぐ。
 
 **FFmpeg コマンド詳細 (publish.sh):**
 
@@ -132,17 +146,19 @@ OBS のストリームキーはパスに影響しない。RTMP アプリ名 (`/l
 
 ```
 OBS
- │ RTMP :1935  (app="live", streamkey=任意)
+ │ RTMP :1935  (app="live", streamkey={stream_key})
  ▼
 mediamtx (media-server)
- └── runOnPublish → publish.sh (MTX_PATH="live/xxx" → STREAM_NAME="live")
-      └── FFmpeg (h264_nvenc → ABR fmp4 LL-HLS)
-           ├─ /hls/live/master.m3u8      ← ABR マスター (high/low 列挙)
-           ├─ /hls/live/high/
-           │    ├── index.m3u8           ← EXT-X-PART 付き
+ │ RTSP :8554  (同一ストリームを RTSP でも提供)
+ └── runOnReady → publish.sh (flock 排他制御)
+      │ MTX_PATH="live/{stream_key}" → STREAM_NAME="{stream_key}"
+      └── FFmpeg (-rtsp_transport tcp -i rtsp://127.0.0.1:8554/live/{stream_key})
+           ├─ /hls/live/{stream_key}/master.m3u8   ← ABR マスター (high/low 列挙)
+           ├─ /hls/live/{stream_key}/high/
+           │    ├── index.m3u8                     ← EXT-X-PART 付き
            │    ├── init_high.mp4
            │    └── seg*.m4s
-           └─ /hls/live/low/
+           └─ /hls/live/{stream_key}/low/
                 ├── index.m3u8
                 ├── init_low.mp4
                 └── seg*.m4s
@@ -150,9 +166,9 @@ mediamtx (media-server)
       ↓ Docker Volume 共有 (read-only)
 
 FastAPI (api-server :8080)
- │ GET /hls/live/master.m3u8
+ │ GET /hls/live/{stream_key}/master.m3u8
  │   → ファイルをそのまま返す
- │ GET /hls/live/high/index.m3u8 [?_HLS_msn=N&_HLS_part=P]
+ │ GET /hls/live/{stream_key}/high/index.m3u8 [?_HLS_msn=N&_HLS_part=P]
  │   → _patch_playlist() でパッチ後に返す
  │     ① EXT-X-PROGRAM-DATE-TIME 注入 (遅延蓄積防止)
  │     ② HOLD-BACK 縮小 (ライブエッジ追従促進)
@@ -204,15 +220,16 @@ VRChat (AVPro) / ブラウザ (HLS.js)
 
 ```
 /hls/live/
-├── master.m3u8          ABR マスタープレイリスト
-├── high/
-│   ├── index.m3u8       EXT-X-PART 付き LL-HLS メディアプレイリスト
-│   ├── init_high.mp4    fmp4 初期化セグメント
-│   └── seg*.m4s         セグメント / パーツ
-└── low/
-    ├── index.m3u8
-    ├── init_low.mp4
-    └── seg*.m4s
+└── {stream_key}/
+    ├── master.m3u8          ABR マスタープレイリスト
+    ├── high/
+    │   ├── index.m3u8       EXT-X-PART 付き LL-HLS メディアプレイリスト
+    │   ├── init_high.mp4    fmp4 初期化セグメント
+    │   └── seg*.m4s         セグメント / パーツ
+    └── low/
+        ├── index.m3u8
+        ├── init_low.mp4
+        └── seg*.m4s
 ```
 
 ### 5.2 プレイリスト形式 (index.m3u8)
@@ -237,7 +254,7 @@ seg00042.m4s
 
 LL-HLS 対応クライアントが送るリクエスト例:
 ```
-GET /hls/live/high/index.m3u8?_HLS_msn=44&_HLS_part=2
+GET /hls/live/{stream_key}/high/index.m3u8?_HLS_msn=44&_HLS_part=2&sid=abc123
 ```
 
 **実装フロー:**
@@ -329,13 +346,13 @@ WebSocket フォールバック用 REST エンドポイント。
 
 ```json
 {
-  "key":     "live",
+  "key":     "kawasaki",
   "active":  true,
-  "hls_url": "/hls/live/master.m3u8"
+  "hls_url": "/hls/live/kawasaki/master.m3u8"
 }
 ```
 
-`active` は `/hls/{key}/high/index.m3u8` の存在で判定。
+`active` は `/hls/live/{key}/high/index.m3u8` の存在で判定。
 
 ### GET /hls/{path}
 
@@ -343,20 +360,27 @@ HLS ファイル配信。
 
 | パス | 内容 |
 |------|------|
-| `/hls/live/master.m3u8` | ABR マスタープレイリスト (high/low 両バリアント列挙) |
-| `/hls/live/high/index.m3u8` | high メディアプレイリスト (EXT-X-PART 付き、パッチ済み) |
-| `/hls/live/high/init_high.mp4` | high fmp4 初期化セグメント |
-| `/hls/live/high/seg*.m4s` | high セグメント / パーツ |
-| `/hls/live/low/index.m3u8` | low メディアプレイリスト (720p、パッチ済み) |
-| `/hls/live/low/init_low.mp4` | low fmp4 初期化セグメント |
-| `/hls/live/low/seg*.m4s` | low セグメント / パーツ |
+| `/hls/live/{key}/master.m3u8` | ABR マスタープレイリスト (high/low 両バリアント列挙) |
+| `/hls/live/{key}/high/index.m3u8` | high メディアプレイリスト (EXT-X-PART 付き、パッチ済み) |
+| `/hls/live/{key}/high/init_high.mp4` | high fmp4 初期化セグメント |
+| `/hls/live/{key}/high/seg*.m4s` | high セグメント / パーツ |
+| `/hls/live/{key}/low/index.m3u8` | low メディアプレイリスト (720p、パッチ済み) |
+| `/hls/live/{key}/low/init_low.mp4` | low fmp4 初期化セグメント |
+| `/hls/live/{key}/low/seg*.m4s` | low セグメント / パーツ |
+
+`{key}` は OBS で設定したストリームキー。
 
 **LL-HLS ブロッキングクエリパラメータ:**
+
+```
+GET /hls/live/{key}/high/index.m3u8?_HLS_msn=44&_HLS_part=2&sid=abc123
+```
 
 | パラメータ | 説明 |
 |---|---|
 | `_HLS_msn` | 待機するメディアシーケンス番号 |
 | `_HLS_part` | 待機するパーツ番号 |
+| `sid` | セッション ID (master.m3u8 取得時に払い出し、以降のリクエストに付与) |
 
 **全レスポンス共通ヘッダー:**
 
@@ -398,7 +422,7 @@ Access-Control-Allow-Origin: *
 | `MAX_SESSIONS` | `100` | 同時視聴上限 |
 | `SESSION_TIMEOUT` | `8.0` | セッション自動消滅秒数 (LL-HLS ブロッキングタイムアウト 5s より長く設定) |
 | `QUEUE_TIMEOUT` | `20.0` | キュー待機タイムアウト秒数 |
-| `MAX_BPS` | `1375000` | セッションあたり最大受信バイト/秒 (11 Mbps 相当) |
+| `MAX_BPS` | `3000000` | セッションあたり最大受信バイト/秒 (24 Mbps 相当、hls.js 起動バースト対策) |
 
 ### GOP と segment_time の関係
 
@@ -453,4 +477,4 @@ result = {
 
 ---
 
-*最終更新: 2026-06-06*
+*最終更新: 2026-06-07*

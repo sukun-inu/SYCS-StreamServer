@@ -38,10 +38,13 @@ RUN wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.bz2" -O /t
         --disable-doc \
         --disable-debug \
         --disable-ffplay \
+        --extra-ldflags="-Wl,-Bstatic -lx264 -Wl,-Bdynamic" \
     && make -j"$(nproc)" \
     && make install \
     && strip /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
-    && rm -rf /tmp/ffmpeg*
+    && rm -rf /tmp/ffmpeg* \
+    && /usr/local/bin/ffmpeg -version 2>&1 | grep -q "ffmpeg version" \
+    && /usr/local/bin/ffmpeg -encoders 2>&1 | grep -q "libx264"
 
 # ── Stage 3: 実行イメージ ─────────────────────────────────────────────────────
 FROM nvidia/cuda:${CUDA_VERSION}

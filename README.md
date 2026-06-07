@@ -55,8 +55,8 @@ OBS Studio
 
 | 項目 | 要件 |
 |------|------|
-| OS | Ubuntu 22.04 LTS (KVM/QEMU 仮想化可) |
-| GPU | GTX1650 以上 (NVENC 対応)、なければ libx264 自動フォールバック |
+| OS | Ubuntu 22.04 LTS 以上 (KVM/QEMU 仮想化可) |
+| GPU | GTX1650 以上 (NVENC 対応)、なければ libx264 自動フォールバック。NVIDIA ドライバ 560 以上推奨 |
 | RAM | 4GB 以上 |
 | Docker | 20.10 以上 + NVIDIA Container Toolkit 設定済み |
 | Docker Compose | v2.x 以上 |
@@ -105,8 +105,10 @@ ngrok の RTMP URL・VRChat URL が表示されます。
 |------|-----|
 | 設定 → 配信 → サービス | **カスタム...** |
 | サーバー | ポータルの「RTMP URL」欄の URL (例: `rtmp://0.tcp.jp.ngrok.io:XXXXX/live`) |
-| ストリームキー | **任意** (何を入力しても動作します) |
+| ストリームキー | **任意の半角英数字** (例: `mystream`) — **このキーが視聴 URL のパスになります** |
 
+> ストリームキーは HLS 出力先ディレクトリ名を決定します。  
+> ポータルで視聴 URL を生成する際は OBS と同じキーを入力してください。  
 > ngrok が起動していない場合はポータルにローカル IP の RTMP URL が表示されます。  
 > LAN 内から配信する場合は `ngrok-rtmp` サービスを docker-compose.yml でコメントアウトできます。
 
@@ -126,7 +128,7 @@ ngrok の RTMP URL・VRChat URL が表示されます。
 `http://サーバーIP:8080` にアクセスすると OBS 配信設定と視聴 URL 生成ページが開きます。
 
 1. **OBS 配信設定** — RTMP URL が自動表示される。ngrok 起動中は ngrok URL、未起動時は LAN IP を表示。
-2. **視聴 URL 生成** — ストリームキー欄に `live` と入力して「確認」を押す。
+2. **視聴 URL 生成** — ストリームキー欄に **OBS で設定したキーと同じ値** を入力して「確認」を押す。
 3. **VRChat URL** が生成されるのでコピーして VRChat のビデオプレイヤーに貼り付ける。
 
 ---
@@ -197,7 +199,7 @@ Portainer の **Stacks → Add stack → Repository** から:
 | `MAX_SESSIONS` | `100` | 同時視聴上限 (超過新規接続はキュー待機) |
 | `SESSION_TIMEOUT` | `8.0` | 最終リクエストからのセッション消滅秒数 |
 | `QUEUE_TIMEOUT` | `20.0` | キュー待機タイムアウト秒数 (超過で 503) |
-| `MAX_BPS` | `1375000` | セッションあたり最大受信バイト/秒 (超過で 429) |
+| `MAX_BPS` | `3000000` | セッションあたり最大受信バイト/秒 (24 Mbps 相当、hls.js 起動バースト対策、超過で 429) |
 
 ### API / ログ
 
@@ -293,7 +295,7 @@ sudo systemctl restart docker
 
 1. `.env` で `HLS_SEGMENT_TIME=0.5`・`HLS_PART_DURATION=0.1` になっているか確認
 2. OBS のキーフレーム間隔を 1 秒に設定する
-3. ブラウザで `/hls/live/high/index.m3u8` を開き `EXT-X-PROGRAM-DATE-TIME` タグがあるか確認
+3. ブラウザで `/hls/live/{stream_key}/high/index.m3u8` を開き `EXT-X-PROGRAM-DATE-TIME` タグがあるか確認
 
 ### Cloudflare Tunnel 経由でアクセスできない
 

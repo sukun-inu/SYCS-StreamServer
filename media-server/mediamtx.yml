@@ -4,6 +4,9 @@ logDestinations: [stdout]
 # RTMP ingest (OBS → port 1935)
 rtmpAddress: :1935
 
+# RTSP サーバー (publish.sh の FFmpeg が TCP で読む)
+rtspAddress: :8554
+
 # 不要なプロトコルを無効化
 hls: no
 webrtc: no
@@ -12,8 +15,8 @@ srt: no
 paths:
   # OBS が rtmp://host:1935/live でアプリ名 "live"、ストリームキー任意の場合
   # mediamtx が作成するパスは "live/..." になる。
-  # runOnReady は環境変数 MTX_PATH="live/..." を渡すため引数なしで OK。
-  # (旧称 runOnPublish は現行バージョンで runOnReady に改名された)
+  # runOnReady は OBS が接続して最初のフレームが届いた時点で発火する。
+  # publish.sh は MTX_PATH="live/key" を受け取り STREAM_NAME=key として RTSP で読む。
   all_others:
     runOnReady: /usr/local/bin/publish.sh
     runOnReadyRestart: yes

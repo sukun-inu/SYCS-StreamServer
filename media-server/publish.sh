@@ -33,6 +33,7 @@ echo "[publish:$$] $(date -u +%FT%TZ) start key=${STREAM_NAME} MTX_PATH=${MTX_PA
 
 VIDEO_BITRATE_LOW="${VIDEO_BITRATE_LOW:-2000k}"
 AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
+VIDEO_FPS_LOW="${VIDEO_FPS_LOW:-30}"
 TRANSCODE_RESTART_DELAY="${TRANSCODE_RESTART_DELAY:-1}"
 
 PID=""
@@ -60,19 +61,40 @@ vbr_params() {
 }
 read -r BV_L BV_L_MAX BV_L_BUF <<< "$(vbr_params "${VIDEO_BITRATE_LOW}")"
 
-if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc'; then
-    echo "[publish:${STREAM_NAME}] encoder=h264_nvenc  low=${BV_L}"
+ffmpeg_has_encoder() {
+    ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "$1"
+}
+
+ffmpeg_has_filter() {
+    ffmpeg -hide_banner -filters 2>/dev/null | grep -q "$1"
+}
+
+IN_HW=()
+VF=()
+VC=()
+KF=(-r "${VIDEO_FPS_LOW}" -fps_mode cfr -g "${VIDEO_FPS_LOW}" -keyint_min "${VIDEO_FPS_LOW}" \
+    -force_key_frames "expr:gte(t,n_forced*1)")
+
+if ffmpeg_has_encoder 'h264_nvenc'; then
+    if ffmpeg_has_filter 'scale_cuda'; then
+        echo "[publish:${STREAM_NAME}] pipeline=cuda_decode+scale_cuda+h264_nvenc low=${BV_L} fps=${VIDEO_FPS_LOW}"
+        IN_HW=(-hwaccel cuda -hwaccel_output_format cuda -extra_hw_frames 8)
+        VF=(-vf "scale_cuda=w=-2:h=720:format=nv12")
+    else
+        echo "[publish:${STREAM_NAME}] pipeline=cpu_scale+h264_nvenc low=${BV_L} fps=${VIDEO_FPS_LOW} (scale_cuda unavailable)"
+        VF=(-vf "scale=-2:720,fps=${VIDEO_FPS_LOW}")
+    fi
     # -preset p4 -tune ll: 新 NVENC API (旧 llhq 相当)。低遅延 + 中品質。
     # -forced-idr 1: セグメント境界を IDR フレームにして mediamtx が正確に切れるようにする。
     # sc_threshold は libx264 専用のため NVENC には渡さない。
-    VC=(-c:v h264_nvenc -rc vbr -preset p4 -tune ll -forced-idr 1
+    VC=(-c:v h264_nvenc -rc vbr -preset p4 -tune ll -bf 0 -forced-idr 1
         -b:v "${BV_L}" -maxrate "${BV_L_MAX}" -bufsize "${BV_L_BUF}")
-    KF=(-g 60 -keyint_min 60)
 else
-    echo "[publish:${STREAM_NAME}] encoder=libx264  low=${BV_L}"
+    echo "[publish:${STREAM_NAME}] pipeline=cpu_scale+libx264 low=${BV_L} fps=${VIDEO_FPS_LOW}"
+    VF=(-vf "scale=-2:720,fps=${VIDEO_FPS_LOW}")
     VC=(-c:v libx264 -preset ultrafast -tune zerolatency
         -b:v "${BV_L}" -maxrate "${BV_L_MAX}" -bufsize "${BV_L_BUF}")
-    KF=(-g 60 -keyint_min 60 -sc_threshold 0)
+    KF+=(-sc_threshold 0)
 fi
 
 while true; do
@@ -84,11 +106,11 @@ while true; do
         -rtsp_transport tcp \
         -fflags +genpts \
         -use_wallclock_as_timestamps 1 \
+        "${IN_HW[@]}" \
         -i "${INPUT}" \
-        -vf "scale=-2:720" \
+        "${VF[@]}" \
         "${VC[@]}" \
         "${KF[@]}" \
-        -force_key_frames "expr:gte(t,n_forced*1)" \
         -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -af "aresample=async=1000" \
         -f flv "${OUTPUT}" &
     PID=$!

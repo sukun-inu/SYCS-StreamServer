@@ -174,6 +174,25 @@ async def _notify_waiters(rel_path: str) -> None:
                 pass
 
 
+async def _poll_hls_changes() -> None:
+    mtimes: dict[str, int] = {}
+    live_dir = HLS_DIR / "live"
+    while True:
+        try:
+            for fp in live_dir.glob("*/index.m3u8"):
+                rel = str(fp.relative_to(HLS_DIR))
+                try:
+                    mtime = fp.stat().st_mtime_ns
+                except OSError:
+                    continue
+                if mtimes.get(rel) != mtime:
+                    mtimes[rel] = mtime
+                    await _notify_waiters(rel)
+        except Exception:
+            pass
+        await asyncio.sleep(0.1)
+
+
 async def _watch_hls() -> None:
     try:
         from watchfiles import awatch, Change
@@ -274,12 +293,14 @@ def _patch_playlist(content: str) -> str:
     if not content.strip() or "#EXTM3U" not in content:
         return content
     has_pdt = "EXT-X-PROGRAM-DATE-TIME" in content
+    part_target = _playlist_float_tag(content, r"#EXT-X-PART-INF:[^\n]*\bPART-TARGET=([\d.]+)")
+    target_duration = _playlist_float_tag(content, r"#EXT-X-TARGETDURATION:([\d.]+)")
     out: list[str] = []
     pdt_inserted = False
     for line in content.splitlines(keepends=True):
         tag = line.rstrip("\r\n")
         if tag.startswith("#EXT-X-SERVER-CONTROL:"):
-            line = _shrink_hold_back(tag) + "\n"
+            line = _shrink_hold_back(tag, part_target, target_duration) + "\n"
         if not has_pdt and not pdt_inserted and tag.startswith("#EXTINF:"):
             pdt = _estimate_first_segment_pdt(content)
             if pdt:
@@ -289,11 +310,33 @@ def _patch_playlist(content: str) -> str:
     return "".join(out)
 
 
-def _shrink_hold_back(line: str) -> str:
-    def _s(m: re.Match) -> str:
-        # Apple 仕様: PART-HOLD-BACK ≥ 3 × PART-TARGET (100ms パーツ → 0.3s)
-        return f"HOLD-BACK={max(0.3, float(m.group(1)) * 0.6):.3f}"
-    return re.sub(r"\bHOLD-BACK=([\d.]+)", _s, line)
+def _playlist_float_tag(content: str, pattern: str) -> float | None:
+    m = re.search(pattern, content)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _shrink_hold_back(
+    line: str,
+    part_target: float | None,
+    target_duration: float | None,
+) -> str:
+    def _part(m: re.Match) -> str:
+        current = float(m.group(1))
+        lower = (part_target or 0.1) * 3
+        return f"PART-HOLD-BACK={max(lower, current * 0.6):.3f}"
+
+    def _hold(m: re.Match) -> str:
+        current = float(m.group(1))
+        lower = (target_duration or 1.0) * 3
+        return f"HOLD-BACK={max(lower, current * 0.6):.3f}"
+
+    line = re.sub(r"\bPART-HOLD-BACK=([\d.]+)", _part, line)
+    return re.sub(r"(?<!PART-)\bHOLD-BACK=([\d.]+)", _hold, line)
 
 
 def _estimate_first_segment_pdt(content: str) -> str | None:
@@ -474,6 +517,7 @@ async def lifespan(_: FastAPI):
     HLS_DIR.mkdir(parents=True, exist_ok=True)
     tasks = [
         asyncio.create_task(_watch_hls()),
+        asyncio.create_task(_poll_hls_changes()),
         asyncio.create_task(_cleanup_sessions()),
         asyncio.create_task(_cleanup_tokens()),
         asyncio.create_task(_ws_broadcaster()),
@@ -961,7 +1005,7 @@ video{width:100%;height:100%;object-fit:contain}
   <video id="v" controls autoplay playsinline></video>
   <p id="msg">配信待機中...</p>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 <script>
 const KEY = __KEY_JSON__;
 
@@ -1025,20 +1069,47 @@ function _deliverLevel(variant, content) {
 }
 
 // ─── カスタム pLoader (プレイリストを WebSocket から受け取る) ─────────────────
+function _newLoaderStats() {
+  const now = performance.now();
+  return {
+    trequest: now,
+    tfirst: 0,
+    tload: 0,
+    aborted: false,
+    loaded: 0,
+    retry: 0,
+    total: 0,
+    chunkCount: 0,
+    bwEstimate: 0,
+    loading: { start: now, first: 0, end: 0 },
+    parsing: { start: 0, end: 0 },
+    buffering: { start: 0, first: 0, end: 0 },
+  };
+}
+
 class WsPlaylistLoader {
   constructor(_config) {
     this._aborted = false;
     this._pending = null;
+    this.context = null;
+    this.stats = _newLoaderStats();
   }
 
   load(ctx, config, callbacks) {
     this._aborted = false;
+    this.context = ctx;
+    this.stats = _newLoaderStats();
 
     const deliver = (content) => {
       if (this._aborted) return;
       const t = performance.now();
-      callbacks.onSuccess({ data: content, url: ctx.url },
-        { trequest: t, tfirst: t, tload: t }, ctx);
+      this.stats.loaded = content.length;
+      this.stats.total = content.length;
+      this.stats.tfirst = t;
+      this.stats.tload = t;
+      this.stats.loading.first = t;
+      this.stats.loading.end = t;
+      callbacks.onSuccess({ data: content, url: ctx.url }, this.stats, ctx);
     };
 
     if (ctx.type === 'manifest') {
@@ -1057,7 +1128,8 @@ class WsPlaylistLoader {
       }
       const timer = setTimeout(() => {
         this._removePending();
-        callbacks.onTimeout({}, { trequest: performance.now(), tfirst: 0, tload: 0 }, ctx);
+        this.stats.loading.end = performance.now();
+        callbacks.onTimeout(this.stats, ctx);
       }, config.timeout || 10000);
       this._pending = { variant, msn, part, resolve: deliver, timer };
       if (!_ws.levelWaiters[variant]) _ws.levelWaiters[variant] = [];
@@ -1076,8 +1148,11 @@ class WsPlaylistLoader {
 
   abort() {
     this._aborted = true;
+    this.stats.aborted = true;
     if (this._pending) { clearTimeout(this._pending.timer); this._removePending(); }
   }
+
+  getCacheAge() { return 0; }
 
   destroy() { this.abort(); }
 }

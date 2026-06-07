@@ -21,6 +21,7 @@ services:
     environment:
       - VIDEO_BITRATE_LOW=${VIDEO_BITRATE_LOW:-2000k}
       - AUDIO_BITRATE=${AUDIO_BITRATE:-128k}
+      - VIDEO_FPS_LOW=${VIDEO_FPS_LOW:-30}
     deploy:
       resources:
         reservations:

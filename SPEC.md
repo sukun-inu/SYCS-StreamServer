@@ -492,6 +492,7 @@ GET /hls/live/{key}/index.m3u8?_HLS_msn=44&_HLS_part=2&sid=abc123
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
 | `VIDEO_BITRATE_LOW` | `2000k` | low バリアント (720p) 映像平均ビットレート |
+| `VIDEO_FPS_LOW` | `30` | low バリアント固定FPS。`30` は低負荷、`60` は滑らかさ優先 |
 | `AUDIO_BITRATE` | `128k` | low バリアント音声ビットレート |
 
 > high バリアントは OBS からの入力をそのまま受け取るため、ビットレートは OBS 側で設定する。

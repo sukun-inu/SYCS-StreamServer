@@ -19,4 +19,16 @@ else
     echo "[entrypoint] GPU: ${GPU_NAME}"
 fi
 
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc'; then
+    echo "[entrypoint] FFmpeg: h264_nvenc available"
+else
+    echo "[entrypoint] FFmpeg: h264_nvenc unavailable, will fallback to libx264"
+fi
+
+if ffmpeg -hide_banner -filters 2>/dev/null | grep -q 'scale_cuda'; then
+    echo "[entrypoint] FFmpeg: scale_cuda available"
+else
+    echo "[entrypoint] FFmpeg: scale_cuda unavailable, scaling may use CPU"
+fi
+
 exec /usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml

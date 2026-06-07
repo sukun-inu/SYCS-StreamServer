@@ -180,28 +180,30 @@ async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
 
     await ws.accept()
 
-    high_rel = f"live/{key}/index.m3u8"
-    low_rel = f"live/{key}_transcode/index.m3u8"
+    high_rel = f"live/{key}/stream.m3u8"
+    low_rel = f"live/{key}_transcode/stream.m3u8"
     rel_paths = (high_rel, low_rel)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=30)
     await hls.add_playlist_queue(rel_paths, queue)
 
     last_raw: dict[str, str] = {}
 
-    async def push_variant(variant: str, rel_path: str, variant_key: str) -> bool:
-        raw = await hls.read_playlist_content(rel_path)
+    async def push_variant(variant: str, rel_path: str) -> bool:
+        playlist = await hls.read_media_playlist(rel_path)
+        raw = playlist.content if playlist is not None else None
         if raw is None or last_raw.get(variant) == raw:
             return False
         last_raw[variant] = raw
         content = hls.patch_playlist(raw)
-        content = hls.sign_playlist_segments(content, variant_key)
+        base_rel_dir = playlist.rel_path.rsplit("/", 1)[0]
+        content = hls.sign_playlist_segments(content, base_rel_dir)
         await ws.send_json({"type": "level", "variant": variant, "content": content})
         return True
 
     try:
         await ws.send_json({"type": "master", "content": hls.build_ws_master_content(key)})
-        await push_variant("high", high_rel, key)
-        await push_variant("low", low_rel, f"{key}_transcode")
+        await push_variant("high", high_rel)
+        await push_variant("low", low_rel)
 
         loop = asyncio.get_running_loop()
         last_ping = loop.time()
@@ -219,12 +221,12 @@ async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
                     break
 
             if changed_rel == high_rel:
-                await push_variant("high", high_rel, key)
+                await push_variant("high", high_rel)
             elif changed_rel == low_rel:
-                await push_variant("low", low_rel, f"{key}_transcode")
+                await push_variant("low", low_rel)
             else:
-                await push_variant("high", high_rel, key)
-                await push_variant("low", low_rel, f"{key}_transcode")
+                await push_variant("high", high_rel)
+                await push_variant("low", low_rel)
 
             if now - last_ping >= 25.0:
                 last_ping = now
@@ -254,13 +256,14 @@ async def serve_segment(
         "Access-Control-Allow-Origin": "*",
     }
 
-    if not file_path.exists() and not await hls.wait_for_file(file_path):
+    disk_path = await hls.wait_for_existing_file(path)
+    if disk_path is None:
         data = await hls.fetch_mediamtx_hls(path)
         if data is None:
             raise HTTPException(404, "Not found")
         return Response(content=data, media_type=media_type, headers=headers)
 
-    return FileResponse(file_path, media_type=media_type, headers=headers)
+    return FileResponse(disk_path, media_type=media_type, headers=headers)
 
 
 @app.get("/hls/{path:path}")
@@ -274,7 +277,7 @@ async def serve_hls(
     _ensure_hls_path(file_path)
 
     is_master = path.endswith("master.m3u8")
-    is_playlist = path.endswith("index.m3u8")
+    is_playlist = path.endswith(("index.m3u8", "stream.m3u8"))
 
     master_key = _dynamic_master_key(path)
     if master_key is not None:
@@ -294,18 +297,21 @@ async def serve_hls(
         if _HLS_part is not None:
             params["_HLS_part"] = _HLS_part
 
-        if is_playlist and file_path.exists() and _HLS_msn is not None:
-            await hls.block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
+        playlist_disk_path = hls.find_existing_file(path)
+        if is_playlist and playlist_disk_path is not None and _HLS_msn is not None:
+            await hls.block_until_ready(path, playlist_disk_path, _HLS_msn, _HLS_part, timeout=5.0)
 
-        content = await hls.read_playlist_content(path, params=params or None)
-        if content is None:
+        playlist = await hls.read_media_playlist(path, params=params or None)
+        if playlist is None:
             raise HTTPException(404, "Not found")
+        content = playlist.content
         content = hls.patch_playlist(content)
         if sid:
             content = hls.inject_sid(content, sid)
         return _playlist_response(content)
 
-    if not file_path.exists() and not await hls.wait_for_file(file_path):
+    disk_path = await hls.wait_for_existing_file(path)
+    if disk_path is None:
         data = await hls.fetch_mediamtx_hls(path)
         if data is None:
             raise HTTPException(404, "Not found")
@@ -317,15 +323,15 @@ async def serve_hls(
 
     if sid:
         try:
-            nbytes = file_path.stat().st_size
+            nbytes = disk_path.stat().st_size
         except OSError:
             raise HTTPException(404, "Not found")
         if not sessions.check_and_record_bw(sid, nbytes):
             await sessions.revoke(sid)
             raise HTTPException(429, "帯域超過によりセッションを終了しました。")
 
-    media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
-    return FileResponse(file_path, media_type=media_type, headers=NO_CACHE_HEADERS)
+    media_type = MEDIA_TYPES.get(disk_path.suffix, "application/octet-stream")
+    return FileResponse(disk_path, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
 def _ensure_hls_path(file_path) -> None:

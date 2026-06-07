@@ -201,7 +201,11 @@ function showVariants(variants) {
   const items = ['high', 'low'].map(name => {
     const v = variants[name] || {};
     const cls = v.ready ? 'ok' : 'wait';
-    const detail = v.ready ? `${name}: ${v.age_sec}s / ${v.bytes}B` : `${name}: 待機`;
+    const source = v.source || (v.ready ? 'ready' : 'missing');
+    const path = v.path ? ` ${v.path}` : '';
+    const age = Number.isFinite(v.age_sec) ? ` ${v.age_sec}s` : '';
+    const size = Number.isFinite(v.bytes) ? ` ${v.bytes}B` : '';
+    const detail = v.ready ? `${name}: ${source}${path}${age}${size}` : `${name}: ${source}`;
     return `<span class="${cls}">${detail}</span>`;
   });
   el.innerHTML = items.join('');

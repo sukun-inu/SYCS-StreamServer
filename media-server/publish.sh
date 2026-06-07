@@ -58,12 +58,17 @@ read -r BV_L BV_L_MAX BV_L_BUF <<< "$(vbr_params "${VIDEO_BITRATE_LOW}")"
 
 if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'h264_nvenc'; then
     echo "[publish:${STREAM_NAME}] encoder=h264_nvenc  low=${BV_L}"
-    VC=(-c:v h264_nvenc -rc vbr -preset llhq -tune ll
+    # -preset p4 -tune ll: 新 NVENC API (旧 llhq 相当)。低遅延 + 中品質。
+    # -forced-idr 1: セグメント境界を IDR フレームにして mediamtx が正確に切れるようにする。
+    # sc_threshold は libx264 専用のため NVENC には渡さない。
+    VC=(-c:v h264_nvenc -rc vbr -preset p4 -tune ll -forced-idr 1
         -b:v "${BV_L}" -maxrate "${BV_L_MAX}" -bufsize "${BV_L_BUF}")
+    KF=(-g 60 -keyint_min 60)
 else
     echo "[publish:${STREAM_NAME}] encoder=libx264  low=${BV_L}"
     VC=(-c:v libx264 -preset ultrafast -tune zerolatency
         -b:v "${BV_L}" -maxrate "${BV_L_MAX}" -bufsize "${BV_L_BUF}")
+    KF=(-g 60 -keyint_min 60 -sc_threshold 0)
 fi
 
 echo "[publish:${STREAM_NAME}] starting ffmpeg transcode..."
@@ -75,7 +80,7 @@ ffmpeg \
     -i "${INPUT}" \
     -vf "scale=-2:720" \
     "${VC[@]}" \
-    -g 60 -keyint_min 60 -sc_threshold 0 \
+    "${KF[@]}" \
     -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -af "aresample=async=1000" \
     -f flv "${OUTPUT}" &
 PID=$!

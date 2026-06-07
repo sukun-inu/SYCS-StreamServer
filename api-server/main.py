@@ -261,7 +261,8 @@ def _patch_playlist(content: str) -> str:
 
 def _shrink_hold_back(line: str) -> str:
     def _s(m: re.Match) -> str:
-        return f"HOLD-BACK={max(0.5, float(m.group(1)) * 0.6):.3f}"
+        # Apple 仕様: PART-HOLD-BACK ≥ 3 × PART-TARGET (100ms パーツ → 0.3s)
+        return f"HOLD-BACK={max(0.3, float(m.group(1)) * 0.6):.3f}"
     return re.sub(r"\bHOLD-BACK=([\d.]+)", _s, line)
 
 

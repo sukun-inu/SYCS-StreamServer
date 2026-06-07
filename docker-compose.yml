@@ -19,12 +19,8 @@ services:
     volumes:
       - hls-data:/hls
     environment:
-      - VIDEO_BITRATE=${VIDEO_BITRATE:-6000k}
       - VIDEO_BITRATE_LOW=${VIDEO_BITRATE_LOW:-2000k}
-      - AUDIO_BITRATE=${AUDIO_BITRATE:-320k}
-      - HLS_SEGMENT_TIME=${HLS_SEGMENT_TIME:-0.5}
-      - HLS_PART_DURATION=${HLS_PART_DURATION:-0.1}
-      - HLS_LIST_SIZE=${HLS_LIST_SIZE:-6}
+      - AUDIO_BITRATE=${AUDIO_BITRATE:-128k}
     deploy:
       resources:
         reservations:
@@ -58,6 +54,9 @@ services:
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-15.0}
       - QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-20.0}
       - MAX_BPS=${MAX_BPS:-3000000}
+      - SEGMENT_SECRET=${SEGMENT_SECRET:-}
+      - SEGMENT_TTL=${SEGMENT_TTL:-120}
+      - TOKEN_TTL=${TOKEN_TTL:-60}
     restart: ${RESTART_POLICY:-unless-stopped}
     depends_on:
       media-server:

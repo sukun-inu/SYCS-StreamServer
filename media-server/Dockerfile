@@ -13,6 +13,7 @@ COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 # hls_part_duration 不要。RTMP トランスコード (libx264 / h264_nvenc) のみ使用。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # ビルド時に FFmpeg の最低限の動作を確認

@@ -23,18 +23,22 @@ COPY --from=mediamtx      /mediamtx                /usr/local/bin/mediamtx
 COPY --from=ffmpeg-static /usr/local/bin/ffmpeg    /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-static /usr/local/bin/ffprobe   /usr/local/bin/ffprobe
 
-# ビルド時にLL-HLS対応を確認: 失敗時は原因を表示してビルドを止める
-RUN echo "=== ffmpeg version ===" && ffmpeg -version 2>&1 | head -3 \
-    && ffmpeg -version 2>&1 | grep -q "ffmpeg version" \
-        || { echo "FAIL: ffmpeg binary not working"; exit 1; } \
-    && echo "=== libx264 ===" \
-    && ffmpeg -encoders 2>&1 | grep libx264 || true \
+# ビルド時にLL-HLS対応を確認: 実際に -hls_part_duration を渡してエラーが出ないかテスト
+RUN ffmpeg -version 2>&1 | head -1 \
     && ffmpeg -encoders 2>&1 | grep -q "libx264" \
         || { echo "FAIL: libx264 encoder missing"; exit 1; } \
-    && echo "=== hls_part_duration ===" \
-    && ffmpeg -h muxer=hls 2>&1 | grep hls_part_duration || true \
-    && ffmpeg -h muxer=hls 2>&1 | grep -q "hls_part_duration" \
-        || { echo "FAIL: hls_part_duration not supported (LL-HLS unavailable)"; exit 1; } \
+    && mkdir -p /tmp/hls_test \
+    && ffmpeg -v error \
+        -f lavfi -i "color=c=black:s=320x240:r=30" -t 1 \
+        -c:v libx264 -preset ultrafast \
+        -f hls \
+        -hls_time 1 \
+        -hls_part_duration 0.2 \
+        -hls_segment_type fmp4 \
+        -hls_fmp4_init_filename "init.mp4" \
+        /tmp/hls_test/test.m3u8 \
+        || { echo "FAIL: hls_part_duration not accepted (LL-HLS unavailable)"; exit 1; } \
+    && rm -rf /tmp/hls_test \
     && echo "[dockerfile] FFmpeg OK — LL-HLS (hls_part_duration) confirmed"
 
 RUN mkdir -p /etc/mediamtx /hls/live

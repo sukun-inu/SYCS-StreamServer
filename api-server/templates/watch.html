@@ -177,6 +177,7 @@ let _hls     = null;
 let _hlsUp   = false;
 let _retryTm = null;
 let _pollTm  = null;
+let _polling = false;
 let _mediaRecoveries = 0;
 
 function _msg(text) { document.getElementById('msg').style.display = text ? '' : 'none';
@@ -189,7 +190,7 @@ function _startHls() {
     return;
   }
   _hlsUp = true;
-  clearInterval(_pollTm); _pollTm = null;
+  _stopPolling();
   _mediaRecoveries = 0;
   _msg(null);
 
@@ -243,6 +244,12 @@ function _reconnect(message = '接続中...') {
   _msg(message);
   clearTimeout(_retryTm);
   _retryTm = setTimeout(_initWs, RETRY_MS);
+}
+
+function _stopPolling() {
+  clearTimeout(_pollTm);
+  _pollTm = null;
+  _polling = false;
 }
 
 // ─── WebSocket 接続 ───────────────────────────────────────────────────────────
@@ -300,9 +307,19 @@ async function _initWs() {
     _initWs();
   } else {
     _msg('配信待機中...');
-    _pollTm = setInterval(async () => {
-      if (await isActive()) { clearInterval(_pollTm); _pollTm = null; _initWs(); }
-    }, 3000);
+    const poll = async () => {
+      if (_polling) return;
+      _polling = true;
+      const active = await isActive();
+      _polling = false;
+      if (active) {
+        _stopPolling();
+        _initWs();
+        return;
+      }
+      _pollTm = setTimeout(poll, 3000);
+    };
+    _pollTm = setTimeout(poll, 3000);
   }
 })();
 </script>

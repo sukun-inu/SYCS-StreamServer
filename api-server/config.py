@@ -17,8 +17,17 @@ SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "15.0"))
 QUEUE_TIMEOUT = float(os.environ.get("QUEUE_TIMEOUT", "20.0"))
 MAX_BPS = int(os.environ.get("MAX_BPS", str(3_000_000)))
 
+def _csv_env(name: str, default: str) -> list[str]:
+    raw = os.environ.get(name) or default
+    values = [value.strip().rstrip("/") for value in raw.split(",")]
+    return [value for value in values if value]
+
+
 MEDIAMTX_HLS_URL = os.environ.get("MEDIAMTX_HLS_URL", "http://127.0.0.1:8888").rstrip("/")
+MEDIAMTX_HLS_URLS = _csv_env("MEDIAMTX_HLS_URLS", MEDIAMTX_HLS_URL)
 MEDIAMTX_HLS_TIMEOUT = float(os.environ.get("MEDIAMTX_HLS_TIMEOUT", "1.0"))
+HLS_MISSING_CACHE_TTL = float(os.environ.get("HLS_MISSING_CACHE_TTL", "1.0"))
+HLS_CHANGE_POLL_INTERVAL = float(os.environ.get("HLS_CHANGE_POLL_INTERVAL", "0.5"))
 SEGMENT_WAIT_TIMEOUT = float(os.environ.get("SEGMENT_WAIT_TIMEOUT", "1.5"))
 
 SEGMENT_SECRET = (os.environ.get("SEGMENT_SECRET", "") or uuid.uuid4().hex).encode()

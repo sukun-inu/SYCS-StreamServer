@@ -241,7 +241,7 @@ Cloudflare Tunnel / ブラウザ / VRChat
     └── seg*.mp4
 ```
 
-LL-HLS の `index.m3u8` は api-server が `MEDIAMTX_HLS_URL` から取得し、`/hls` 上のファイルはフォールバックとして扱う。
+LL-HLS の media playlist (`stream.m3u8` または `index.m3u8`) は api-server が `MEDIAMTX_HLS_URLS` の候補から取得し、`/hls` 上のファイルはフォールバックとして扱う。
 master.m3u8 は **mediamtx が生成しない**。api-server が動的生成する。
 
 ### 5.2 master.m3u8 動的生成 (api-server)
@@ -500,8 +500,11 @@ GET /hls/live/{key}/index.m3u8?_HLS_msn=44&_HLS_part=2&sid=abc123
 
 | 変数 | デフォルト | 説明 |
 |------|-----------|------|
-| `MEDIAMTX_HLS_URL` | `http://127.0.0.1:8888` | api-server がMediaMTXのLL-HLSプレイリスト/セグメントを読む内部URL |
+| `MEDIAMTX_HLS_URL` | `http://127.0.0.1:8888` | 旧互換のMediaMTX HLS内部URL |
+| `MEDIAMTX_HLS_URLS` | `http://127.0.0.1:8888,http://media-server:8888,http://sycs-media-server:8888` | api-server がMediaMTXのLL-HLSプレイリスト/セグメントを探す内部URL候補 |
 | `MEDIAMTX_HLS_TIMEOUT` | `1.0` | MediaMTX HLS取得タイムアウト秒数 |
+| `HLS_MISSING_CACHE_TTL` | `1.0` | HLS未検出時に短時間キャッシュして待機画面の過剰pollを抑える秒数 |
+| `HLS_CHANGE_POLL_INTERVAL` | `0.5` | watchfiles補助用のHLS変更poll間隔秒数 |
 | `SEGMENT_SECRET` | *(起動ごとランダム)* | セグメント URL 署名 HMAC シークレット。固定したい場合は明示設定 |
 | `SEGMENT_TTL` | `120` | 署名付きセグメント URL の有効期限 (秒) |
 | `SEGMENT_WAIT_TIMEOUT` | `1.5` | LL-HLS の PRELOAD-HINT が未生成 part を先読みした時に待つ秒数 |

@@ -44,9 +44,14 @@ input.empty{color:#484f58}
 <main>
 
   <div class="card">
-    <h2>OBS 配信設定</h2>
+    <h2>配信設定</h2>
     <div class="alert" id="ngrok-alert">⚠ ngrok 無料プランでは再起動ごとに RTMP URL が変わります。</div>
     <div class="alert" id="lan-alert" style="border-color:#1f6feb;color:#79c0ff;display:none">ℹ ngrok 未起動。LAN から直接接続する場合は下記 URL を使用してください。</div>
+    <div class="row">
+      <label>配信名</label>
+      <input id="key-input" type="text" placeholder="例: kawasaki">
+      <button class="btn primary" id="check-btn">確認</button>
+    </div>
     <div class="row">
       <label>RTMP URL</label>
       <input id="u-rtmp" type="text" readonly class="empty" value="取得中...">
@@ -55,15 +60,6 @@ input.empty{color:#484f58}
     <div class="row">
       <label>ストリームキー</label>
       <span style="font-size:.8rem;color:#8b949e">空欄</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>視聴 URL 生成</h2>
-    <div class="row">
-      <label>ストリームキー</label>
-      <input id="key-input" type="text" placeholder="例: stream">
-      <button class="btn primary" id="check-btn">確認</button>
     </div>
     <div id="stream-result">
       <div class="row" style="margin-bottom:8px">

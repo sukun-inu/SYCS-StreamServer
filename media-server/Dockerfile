@@ -38,7 +38,7 @@ RUN wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.bz2" -O /t
         --disable-doc \
         --disable-debug \
         --disable-ffplay \
-        --extra-ldflags="-Wl,-Bstatic -lx264 -Wl,-Bdynamic" \
+        --extra-ldflags="-Wl,-Bstatic -lx264 -lgomp -Wl,-Bdynamic" \
     && make -j"$(nproc)" \
     && make install \
     && strip /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
@@ -56,7 +56,13 @@ COPY --from=ffmpeg-builder /usr/local/bin/ffprobe /usr/local/bin/ffprobe
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         netcat-openbsd \
+        zlib1g \
     && rm -rf /var/lib/apt/lists/*
+
+# 最終ステージでの動作確認: ビルダーで通っても実行環境で失敗するケースを CI で検出する
+RUN /usr/local/bin/ffmpeg -version 2>&1 | grep -q "ffmpeg version" \
+    && /usr/local/bin/ffmpeg -encoders 2>&1 | grep -q "libx264" \
+    && echo "[dockerfile] FFmpeg OK"
 
 RUN mkdir -p /etc/mediamtx /hls/live
 COPY mediamtx.yml /etc/mediamtx/mediamtx.yml

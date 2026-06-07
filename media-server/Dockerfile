@@ -23,10 +23,18 @@ COPY --from=mediamtx      /mediamtx                /usr/local/bin/mediamtx
 COPY --from=ffmpeg-static /usr/local/bin/ffmpeg    /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-static /usr/local/bin/ffprobe   /usr/local/bin/ffprobe
 
-# ビルド時にLL-HLS対応を確認: hls_part_duration がなければ CI でイメージが push されない
-RUN ffmpeg -version 2>&1 | grep -q "ffmpeg version" \
+# ビルド時にLL-HLS対応を確認: 失敗時は原因を表示してビルドを止める
+RUN echo "=== ffmpeg version ===" && ffmpeg -version 2>&1 | head -3 \
+    && ffmpeg -version 2>&1 | grep -q "ffmpeg version" \
+        || { echo "FAIL: ffmpeg binary not working"; exit 1; } \
+    && echo "=== libx264 ===" \
+    && ffmpeg -encoders 2>&1 | grep libx264 || true \
     && ffmpeg -encoders 2>&1 | grep -q "libx264" \
+        || { echo "FAIL: libx264 encoder missing"; exit 1; } \
+    && echo "=== hls_part_duration ===" \
+    && ffmpeg -h muxer=hls 2>&1 | grep hls_part_duration || true \
     && ffmpeg -h muxer=hls 2>&1 | grep -q "hls_part_duration" \
+        || { echo "FAIL: hls_part_duration not supported (LL-HLS unavailable)"; exit 1; } \
     && echo "[dockerfile] FFmpeg OK — LL-HLS (hls_part_duration) confirmed"
 
 RUN mkdir -p /etc/mediamtx /hls/live

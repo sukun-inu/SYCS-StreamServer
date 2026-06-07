@@ -3,25 +3,18 @@ ARG CUDA_VERSION=12.6.3-runtime-ubuntu24.04
 # ── Stage 1: mediamtx バイナリ取得 ───────────────────────────────────────────
 FROM bluenviron/mediamtx:latest AS mediamtx
 
-# ── Stage 2: johnvansickle static FFmpeg 取得 ────────────────────────────────
-# static ビルドなので shared lib 依存なし。hls_part_duration (LL-HLS) を含む 7.x 系。
-FROM ubuntu:24.04 AS ffmpeg-static
-ARG DEBIAN_FRONTEND=noninteractive
-ARG FFMPEG_URL=https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl xz-utils ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64)" "${FFMPEG_URL}" \
-       | tar -xJf - --strip-components=1 -C /tmp --wildcards '*/ffmpeg' '*/ffprobe' \
-    && install -m755 /tmp/ffmpeg /tmp/ffprobe /usr/local/bin/
+# ── Stage 2: mwader/static-ffmpeg ────────────────────────────────────────────
+# Docker multi-stage 専用の static build。LL-HLS (hls_part_duration) 対応済み。
+# /ffmpeg, /ffprobe が置かれている。
+FROM mwader/static-ffmpeg:latest AS ffmpeg-static
 
 # ── Stage 3: 実行イメージ ─────────────────────────────────────────────────────
 FROM nvidia/cuda:${CUDA_VERSION}
 ARG DEBIAN_FRONTEND=noninteractive
 
 COPY --from=mediamtx      /mediamtx                /usr/local/bin/mediamtx
-COPY --from=ffmpeg-static /usr/local/bin/ffmpeg    /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-static /usr/local/bin/ffprobe   /usr/local/bin/ffprobe
+COPY --from=ffmpeg-static /ffmpeg  /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-static /ffprobe /usr/local/bin/ffprobe
 
 # ビルド時にLL-HLS対応を確認: 実際に -hls_part_duration を渡してエラーが出ないかテスト
 RUN ffmpeg -version 2>&1 | head -1 \

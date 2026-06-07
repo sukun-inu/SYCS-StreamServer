@@ -41,6 +41,7 @@ MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS",    "100"))
 SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "15.0"))
 QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))
 MAX_BPS         = int(os.environ.get("MAX_BPS", str(3_000_000)))
+SEGMENT_WAIT_TIMEOUT = float(os.environ.get("SEGMENT_WAIT_TIMEOUT", "1.5"))
 
 # セグメント URL 署名用シークレット (env 未設定時は起動ごとにランダム生成)
 _SEGMENT_SECRET: bytes = (os.environ.get("SEGMENT_SECRET", "") or uuid.uuid4().hex).encode()
@@ -241,6 +242,18 @@ async def _block_until_ready(
                     _waiters[rel_path].remove(ev)
                 except ValueError:
                     pass
+
+
+async def _wait_for_file(file_path: Path, timeout: float = SEGMENT_WAIT_TIMEOUT) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if file_path.exists():
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(remaining, 0.05))
 
 
 def _playlist_satisfies(content: str, msn: int, part: int | None) -> bool:
@@ -694,7 +707,7 @@ async def serve_segment(
     except ValueError:
         raise HTTPException(400, "Invalid path")
 
-    if not file_path.exists():
+    if not file_path.exists() and not await _wait_for_file(file_path):
         raise HTTPException(404, "Not found")
 
     media_type = MEDIA_TYPES.get(file_path.suffix, "application/octet-stream")
@@ -760,7 +773,8 @@ async def serve_hls(
         await _block_until_ready(path, file_path, _HLS_msn, _HLS_part, timeout=5.0)
 
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Not found")
+        if is_playlist or is_master or not await _wait_for_file(file_path):
+            raise HTTPException(status_code=404, detail="Not found")
 
     if path.endswith(".m3u8"):
         try:
@@ -792,486 +806,28 @@ async def serve_hls(
 
 # ─── HTML ─────────────────────────────────────────────────────────────────────
 
-_PORTAL_HTML = """\
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SYCS Stream Server</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
-header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:10px}
-header h1{font-size:1.1rem;font-weight:700;color:#58a6ff}
-.chip{background:#1f6feb;color:#fff;font-size:.65rem;padding:2px 7px;border-radius:10px;font-weight:600}
-#cap{margin-left:auto;font-size:.75rem;color:#56d364}
-main{max-width:640px;margin:32px auto;padding:0 16px;display:flex;flex-direction:column;gap:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 20px}
-.card h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:#8b949e;margin-bottom:14px;font-weight:600}
-.row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
-.row:last-child{margin-bottom:0}
-label{font-size:.75rem;color:#8b949e;width:96px;flex-shrink:0}
-input[type=text]{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;color:#e6edf3;font-family:monospace;font-size:.8rem;min-width:0}
-input[readonly]{color:#58a6ff}
-input.empty{color:#484f58}
-.btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:5px 12px;font-size:.75rem;cursor:pointer;white-space:nowrap;flex-shrink:0}
-.btn:hover{background:#30363d}
-.btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
-.btn.primary:hover{background:#388bfd}
-.btn.ok{color:#3fb950;border-color:#3fb950}
-.alert{background:#1c2128;border:1px solid #9e6a03;border-radius:6px;padding:8px 12px;font-size:.75rem;color:#d29922;margin-bottom:12px;display:none}
-.alert.show{display:block}
-#stream-result{display:none;margin-top:12px;padding-top:12px;border-top:1px solid #21262d}
-.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
-.live{background:#3fb950;box-shadow:0 0 5px #3fb950}.off{background:#484f58}
-</style>
-</head>
-<body>
-<header>
-  <h1>SYCS Stream Server</h1>
-  <span class="chip">LL-HLS</span>
-  <span id="cap" title="接続中 / 最大">● 0 / 0</span>
-</header>
-<main>
+APP_DIR = Path(__file__).resolve().parent
+TEMPLATE_DIR = APP_DIR / "templates"
 
-  <div class="card">
-    <h2>OBS 配信設定</h2>
-    <div class="alert" id="ngrok-alert">⚠ ngrok 無料プランでは再起動ごとに RTMP URL が変わります。</div>
-    <div class="alert" id="lan-alert" style="border-color:#1f6feb;color:#79c0ff;display:none">ℹ ngrok 未起動。LAN から直接接続する場合は下記 URL を使用してください。</div>
-    <div class="row">
-      <label>RTMP URL</label>
-      <input id="u-rtmp" type="text" readonly class="empty" value="取得中...">
-      <button class="btn" onclick="cp('u-rtmp',this)">コピー</button>
-    </div>
-    <div class="row">
-      <label>ストリームキー</label>
-      <span style="font-size:.8rem;color:#8b949e">OBS で任意の値を設定してください</span>
-    </div>
-  </div>
 
-  <div class="card">
-    <h2>視聴 URL 生成</h2>
-    <div class="row">
-      <label>ストリームキー</label>
-      <input id="key-input" type="text" placeholder="例: stream">
-      <button class="btn primary" onclick="checkStream()">確認</button>
-    </div>
-    <div id="stream-result">
-      <div class="row" style="margin-bottom:8px">
-        <span class="status-dot" id="s-dot"></span>
-        <span id="s-label" style="font-size:.85rem;font-weight:600"></span>
-      </div>
-      <div class="row">
-        <label>VRChat URL</label>
-        <input id="u-vrc" type="text" readonly class="empty" value="">
-        <button class="btn" onclick="cp('u-vrc',this)">コピー</button>
-      </div>
-      <div class="row">
-        <label>視聴ページ</label>
-        <input id="u-watch" type="text" readonly class="empty" value="">
-        <button class="btn" onclick="openWatch()">開く</button>
-        <button class="btn" onclick="cp('u-watch',this)">コピー</button>
-      </div>
-    </div>
-  </div>
-
-</main>
-<script>
-let siteBase = '';
-let ws = null;
-let reconnectTimer = null;
-let pollTimer = null;
-
-function setVal(id, val, empty) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.value = val;
-  el.classList.toggle('empty', empty == null ? !val : empty);
-}
-
-function applyNgrokData(d) {
-  if (typeof d.site === 'string' && d.site) siteBase = d.site;
-  const hasNgrok = typeof d.rtmp === 'string' && d.rtmp !== '';
-  const displayUrl = hasNgrok ? d.rtmp : (d.rtmp_local || '');
-  if (displayUrl) setVal('u-rtmp', displayUrl, !hasNgrok);
-  document.getElementById('ngrok-alert').classList.toggle('show', hasNgrok);
-  const lanEl = document.getElementById('lan-alert');
-  lanEl.style.display = !hasNgrok && displayUrl ? 'block' : 'none';
-}
-
-function applyCapacity(active, max) {
-  const pct = max > 0 ? active / max : 0;
-  const el = document.getElementById('cap');
-  el.textContent = `● ${active} / ${max}`;
-  el.style.color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
-}
-
-async function fetchFromRest() {
-  try {
-    const r = await fetch('/api/ngrok');
-    if (r.ok) applyNgrokData(await r.json());
-  } catch {}
-  try {
-    const r = await fetch('/api/status');
-    if (r.ok) { const s = await r.json(); applyCapacity(s.active, s.max); }
-  } catch {}
-}
-
-function connectWS() {
-  clearTimeout(reconnectTimer);
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.onopen = () => { clearInterval(pollTimer); pollTimer = null; };
-  ws.onmessage = e => {
-    const d = JSON.parse(e.data);
-    if (d.ping) return;
-    if ('rtmp' in d || 'site' in d) applyNgrokData(d);
-    if (d.sessions) applyCapacity(d.sessions.active, d.sessions.max);
-  };
-  ws.onclose = () => {
-    ws = null;
-    if (!pollTimer) pollTimer = setInterval(fetchFromRest, 10000);
-    reconnectTimer = setTimeout(connectWS, 5000);
-  };
-  ws.onerror = () => ws && ws.close();
-}
-
-fetchFromRest();
-connectWS();
-
-function cp(id, btn) {
-  const el = document.getElementById(id);
-  if (!el || el.classList.contains('empty')) return;
-  navigator.clipboard.writeText(el.value).then(() => {
-    const orig = btn.textContent;
-    btn.textContent = '✓'; btn.classList.add('ok');
-    setTimeout(() => { btn.textContent = orig; btn.classList.remove('ok'); }, 2000);
-  });
-}
-
-function openWatch() {
-  const el = document.getElementById('u-watch');
-  if (el && !el.classList.contains('empty')) window.open(el.value, '_blank');
-}
-
-async function checkStream() {
-  const key = document.getElementById('key-input').value.trim();
-  if (!key) return;
-  document.getElementById('stream-result').style.display = 'block';
-  try {
-    const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
-    if (!r.ok) { showStatus(false, '無効なキーです'); return; }
-    const d = await r.json();
-    const base = (siteBase || location.origin).replace(/\\/$/, '');
-    showStatus(d.active, d.active ? 'LIVE' : '待機中');
-    setVal('u-vrc',   `${base}${d.hls_url}`, false);
-    setVal('u-watch', `${base}/watch/${encodeURIComponent(key)}`, false);
-  } catch {
-    showStatus(false, '取得失敗');
-  }
-}
-
-function showStatus(live, label) {
-  document.getElementById('s-dot').className = 'status-dot ' + (live ? 'live' : 'off');
-  document.getElementById('s-label').textContent = label;
-}
-
-document.getElementById('key-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') checkStream();
-});
-</script>
-</body>
-</html>
-"""
-
-_WATCH_HTML = """\
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>視聴中 — SYCS</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{width:100%;height:100%;background:#000;overflow:hidden}
-#wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
-video{width:100%;height:100%;object-fit:contain}
-#msg{position:absolute;color:#484f58;font-family:'Segoe UI',system-ui,sans-serif;font-size:.9rem;pointer-events:none;text-align:center;padding:8px}
-</style>
-</head>
-<body>
-<div id="wrap">
-  <video id="v" controls autoplay playsinline></video>
-  <p id="msg">配信待機中...</p>
-</div>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
-<script>
-const KEY = __KEY_JSON__;
-
-// ─── WebSocket HLS 共有状態 ───────────────────────────────────────────────────
-const _ws = {
-  conn:         null,
-  master:       null,         // master content string | null
-  masterWaiters: [],          // [resolve fn]
-  levels:       {},           // 'high'|'low' → content string
-  levelWaiters: {},           // 'high'|'low' → [{msn,part,resolve,timer}]
-};
-
-// ─── LL-HLS ユーティリティ ────────────────────────────────────────────────────
-function _parseMsn(url) {
-  try {
-    const u = new URL(url, location.href);
-    const msn  = u.searchParams.get('_HLS_msn');
-    const part = u.searchParams.get('_HLS_part');
-    return {
-      msn:  msn  !== null ? parseInt(msn,  10) : null,
-      part: part !== null ? parseInt(part, 10) : null,
-    };
-  } catch { return { msn: null, part: null }; }
-}
-
-function _hlsSatisfies(content, msn, part) {
-  if (msn === null) return true;
-  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\\d+)/);
-  if (!seqM) return false;
-  const base   = parseInt(seqM[1], 10);
-  const segs   = (content.match(/#EXTINF:/g) || []).length;
-  const maxMsn = base + segs - 1;
-  if (msn <= maxMsn) return true;    // 完了済みセグメント (part の有無に関わらず)
-  if (msn > maxMsn + 1) return false; // 未存在セグメント
-  // msn === maxMsn + 1: 現在構築中の partial セグメント
-  if (part === null) return false;
-  // 末尾の partial セグメントのパーツ数を数える
-  const lastInfPos = content.lastIndexOf('#EXTINF:');
-  let tail = content;
-  if (lastInfPos >= 0) {
-    const nl1 = content.indexOf('\\n', lastInfPos);
-    const nl2 = nl1 >= 0 ? content.indexOf('\\n', nl1 + 1) : -1;
-    tail = content.slice(nl2 + 1);
-  }
-  return (tail.match(/#EXT-X-PART:/g) || []).length > part;
-}
-
-function _deliverLevel(variant, content) {
-  _ws.levels[variant] = content;
-  const pending = (_ws.levelWaiters[variant] || []).splice(0);
-  const remaining = [];
-  for (const req of pending) {
-    if (_hlsSatisfies(content, req.msn, req.part)) {
-      clearTimeout(req.timer);
-      req.resolve(content);
-    } else {
-      remaining.push(req);
-    }
-  }
-  _ws.levelWaiters[variant] = remaining;
-}
-
-// ─── カスタム pLoader (プレイリストを WebSocket から受け取る) ─────────────────
-function _newLoaderStats() {
-  const now = performance.now();
-  return {
-    trequest: now,
-    tfirst: 0,
-    tload: 0,
-    aborted: false,
-    loaded: 0,
-    retry: 0,
-    total: 0,
-    chunkCount: 0,
-    bwEstimate: 0,
-    loading: { start: now, first: 0, end: 0 },
-    parsing: { start: 0, end: 0 },
-    buffering: { start: 0, first: 0, end: 0 },
-  };
-}
-
-class WsPlaylistLoader {
-  constructor(_config) {
-    this._aborted = false;
-    this._pending = null;
-    this.context = null;
-    this.stats = _newLoaderStats();
-  }
-
-  load(ctx, config, callbacks) {
-    this._aborted = false;
-    this.context = ctx;
-    this.stats = _newLoaderStats();
-
-    const deliver = (content) => {
-      if (this._aborted) return;
-      const t = performance.now();
-      this.stats.loaded = content.length;
-      this.stats.total = content.length;
-      this.stats.tfirst = t;
-      this.stats.tload = t;
-      this.stats.loading.first = t;
-      this.stats.loading.end = t;
-      callbacks.onSuccess({ data: content, url: ctx.url }, this.stats, ctx);
-    };
-
-    if (ctx.type === 'manifest') {
-      if (_ws.master !== null) { setTimeout(() => deliver(_ws.master), 0); return; }
-      _ws.masterWaiters.push(deliver);
-      return;
-    }
-
-    if (ctx.type === 'level') {
-      const variant = ctx.url.includes('_transcode') ? 'low' : 'high';
-      const { msn, part } = _parseMsn(ctx.url);
-      const latest = _ws.levels[variant];
-      if (latest !== undefined && _hlsSatisfies(latest, msn, part)) {
-        setTimeout(() => deliver(latest), 0);
-        return;
-      }
-      const timer = setTimeout(() => {
-        this._removePending();
-        this.stats.loading.end = performance.now();
-        callbacks.onTimeout(this.stats, ctx);
-      }, config.timeout || 10000);
-      this._pending = { variant, msn, part, resolve: deliver, timer };
-      if (!_ws.levelWaiters[variant]) _ws.levelWaiters[variant] = [];
-      _ws.levelWaiters[variant].push(this._pending);
-      return;
-    }
-  }
-
-  _removePending() {
-    if (!this._pending) return;
-    const list = _ws.levelWaiters[this._pending.variant] || [];
-    const idx = list.indexOf(this._pending);
-    if (idx >= 0) list.splice(idx, 1);
-    this._pending = null;
-  }
-
-  abort() {
-    this._aborted = true;
-    this.stats.aborted = true;
-    if (this._pending) { clearTimeout(this._pending.timer); this._removePending(); }
-  }
-
-  getCacheAge() { return 0; }
-
-  destroy() { this.abort(); }
-}
-
-// ─── プレイヤー制御 ───────────────────────────────────────────────────────────
-let _hls     = null;
-let _hlsUp   = false;
-let _retryTm = null;
-let _pollTm  = null;
-
-function _msg(text) { document.getElementById('msg').style.display = text ? '' : 'none';
-                      document.getElementById('msg').textContent   = text || ''; }
-
-function _startHls() {
-  if (_hlsUp) return;
-  _hlsUp = true;
-  clearInterval(_pollTm); _pollTm = null;
-  _msg(null);
-
-  const video = document.getElementById('v');
-  if (_hls) _hls.destroy();
-  _hls = new Hls({
-    lowLatencyMode:             true,
-    backBufferLength:           2,
-    maxBufferLength:            4,
-    liveSyncDurationCount:      1,
-    liveMaxLatencyDurationCount: 3,
-    liveDurationInfinity:       true,
-    pLoader:                    WsPlaylistLoader,
-  });
-  _hls.loadSource(`/hls/live/${KEY}/master.m3u8`);
-  _hls.attachMedia(video);
-  _hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-  _hls.on(Hls.Events.ERROR, (_, d) => {
-    if (d.fatal) { _hls.destroy(); _hls = null; _hlsUp = false; _reconnect(); }
-  });
-}
-
-function _resetWsState() {
-  _ws.master = null;
-  _ws.masterWaiters.length = 0;
-  _ws.levels = {};
-  for (const list of Object.values(_ws.levelWaiters)) {
-    for (const r of list.splice(0)) clearTimeout(r.timer);
-  }
-}
-
-function _reconnect() {
-  if (_hls) { _hls.destroy(); _hls = null; _hlsUp = false; }
-  _resetWsState();
-  clearTimeout(_retryTm);
-  _retryTm = setTimeout(_initWs, 3000);
-}
-
-// ─── WebSocket 接続 ───────────────────────────────────────────────────────────
-async function _initWs() {
-  let token;
-  try {
-    const r = await fetch(`/api/token/${encodeURIComponent(KEY)}`);
-    if (!r.ok) throw new Error();
-    token = (await r.json()).token;
-  } catch { _msg('接続中...'); _reconnect(); return; }
-
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(
-    `${proto}//${location.host}/ws/hls/${encodeURIComponent(KEY)}?token=${encodeURIComponent(token)}`
-  );
-  _ws.conn = ws;
-
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'ping') return;
-    if (msg.type === 'master') {
-      _ws.master = msg.content;
-      for (const fn of _ws.masterWaiters.splice(0)) fn(msg.content);
-      if (!_hlsUp) _startHls();
-    }
-    if (msg.type === 'level') _deliverLevel(msg.variant, msg.content);
-  };
-
-  ws.onclose = () => { _ws.conn = null; _reconnect(); };
-  ws.onerror = () => ws.close();
-}
-
-// ─── 起動 ────────────────────────────────────────────────────────────────────
-(async () => {
-  async function isActive() {
-    try {
-      const r = await fetch(`/api/stream/${encodeURIComponent(KEY)}`);
-      return r.ok && (await r.json()).active;
-    } catch { return false; }
-  }
-
-  if (await isActive()) {
-    _initWs();
-  } else {
-    _msg('配信待機中...');
-    _pollTm = setInterval(async () => {
-      if (await isActive()) { clearInterval(_pollTm); _pollTm = null; _initWs(); }
-    }, 3000);
-  }
-})();
-</script>
-</body>
-</html>
-"""
+def _read_template(name: str) -> str:
+    try:
+        return (TEMPLATE_DIR / name).read_text(encoding="utf-8")
+    except OSError:
+        raise HTTPException(500, "テンプレートが見つかりません。")
 
 
 @app.get("/", response_class=HTMLResponse)
 async def portal():
-    return _PORTAL_HTML
+    return HTMLResponse(_read_template("portal.html"))
 
 
 @app.get("/watch/{key}", response_class=HTMLResponse)
 async def watch_page(key: str):
     if not _KEY_RE.match(key):
         raise HTTPException(400, "無効なストリームキーです。")
-    return _WATCH_HTML.replace("__KEY_JSON__", json.dumps(key))
-
+    content = _read_template("watch.html").replace("__KEY_JSON__", json.dumps(key))
+    return HTMLResponse(content)
 
 # ─── 起動 ─────────────────────────────────────────────────────────────────────
 

@@ -503,6 +503,7 @@ GET /hls/live/{key}/index.m3u8?_HLS_msn=44&_HLS_part=2&sid=abc123
 |------|-----------|------|
 | `SEGMENT_SECRET` | *(起動ごとランダム)* | セグメント URL 署名 HMAC シークレット。固定したい場合は明示設定 |
 | `SEGMENT_TTL` | `120` | 署名付きセグメント URL の有効期限 (秒) |
+| `SEGMENT_WAIT_TIMEOUT` | `1.5` | LL-HLS の PRELOAD-HINT が未生成 part を先読みした時に待つ秒数 |
 | `TOKEN_TTL` | `60` | ワンタイムトークンの有効期限 (秒) |
 
 > `SEGMENT_SECRET` 未設定時は再起動ごとにランダム生成されるため、古い署名 URL がすべて失効する (再生中断なし、hls.js が新プレイリストを受け取れば復旧)。

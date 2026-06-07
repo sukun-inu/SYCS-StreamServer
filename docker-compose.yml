@@ -57,6 +57,7 @@ services:
       - MAX_BPS=${MAX_BPS:-3000000}
       - SEGMENT_SECRET=${SEGMENT_SECRET:-}
       - SEGMENT_TTL=${SEGMENT_TTL:-120}
+      - SEGMENT_WAIT_TIMEOUT=${SEGMENT_WAIT_TIMEOUT:-1.5}
       - TOKEN_TTL=${TOKEN_TTL:-60}
     restart: ${RESTART_POLICY:-unless-stopped}
     depends_on:

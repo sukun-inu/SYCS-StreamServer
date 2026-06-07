@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SYCS Stream Server</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;display:flex;align-items:center;gap:10px}
+header h1{font-size:1.1rem;font-weight:700;color:#58a6ff}
+.chip{background:#1f6feb;color:#fff;font-size:.65rem;padding:2px 7px;border-radius:10px;font-weight:600}
+#cap{margin-left:auto;font-size:.75rem;color:#56d364}
+main{max-width:640px;margin:32px auto;padding:0 16px;display:flex;flex-direction:column;gap:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px 20px}
+.card h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:#8b949e;margin-bottom:14px;font-weight:600}
+.row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.row:last-child{margin-bottom:0}
+label{font-size:.75rem;color:#8b949e;width:96px;flex-shrink:0}
+input[type=text]{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:6px 10px;color:#e6edf3;font-family:monospace;font-size:.8rem;min-width:0}
+input[readonly]{color:#58a6ff}
+input.empty{color:#484f58}
+.btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:5px 12px;font-size:.75rem;cursor:pointer;white-space:nowrap;flex-shrink:0}
+.btn:hover{background:#30363d}
+.btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn.primary:hover{background:#388bfd}
+.btn.ok{color:#3fb950;border-color:#3fb950}
+.alert{background:#1c2128;border:1px solid #9e6a03;border-radius:6px;padding:8px 12px;font-size:.75rem;color:#d29922;margin-bottom:12px;display:none}
+.alert.show{display:block}
+#stream-result{display:none;margin-top:12px;padding-top:12px;border-top:1px solid #21262d}
+.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.live{background:#3fb950;box-shadow:0 0 5px #3fb950}.off{background:#484f58}
+.diag{display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 10px 104px;font-size:.72rem;color:#8b949e}
+.diag span{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:3px 7px}
+.diag .ok{color:#3fb950;border-color:#238636}.diag .wait{color:#d29922;border-color:#9e6a03}
+</style>
+</head>
+<body>
+<header>
+  <h1>SYCS Stream Server</h1>
+  <span class="chip">LL-HLS</span>
+  <span id="cap" title="接続中 / 最大">● 0 / 0</span>
+</header>
+<main>
+
+  <div class="card">
+    <h2>OBS 配信設定</h2>
+    <div class="alert" id="ngrok-alert">⚠ ngrok 無料プランでは再起動ごとに RTMP URL が変わります。</div>
+    <div class="alert" id="lan-alert" style="border-color:#1f6feb;color:#79c0ff;display:none">ℹ ngrok 未起動。LAN から直接接続する場合は下記 URL を使用してください。</div>
+    <div class="row">
+      <label>RTMP URL</label>
+      <input id="u-rtmp" type="text" readonly class="empty" value="取得中...">
+      <button class="btn" data-copy="u-rtmp">コピー</button>
+    </div>
+    <div class="row">
+      <label>ストリームキー</label>
+      <span style="font-size:.8rem;color:#8b949e">OBS で任意の値を設定してください</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>視聴 URL 生成</h2>
+    <div class="row">
+      <label>ストリームキー</label>
+      <input id="key-input" type="text" placeholder="例: stream">
+      <button class="btn primary" id="check-btn">確認</button>
+    </div>
+    <div id="stream-result">
+      <div class="row" style="margin-bottom:8px">
+        <span class="status-dot" id="s-dot"></span>
+        <span id="s-label" style="font-size:.85rem;font-weight:600"></span>
+      </div>
+      <div class="diag" id="variant-status"></div>
+      <div class="row">
+        <label>VRChat URL</label>
+        <input id="u-vrc" type="text" readonly class="empty" value="">
+        <button class="btn" data-copy="u-vrc">コピー</button>
+      </div>
+      <div class="row">
+        <label>視聴ページ</label>
+        <input id="u-watch" type="text" readonly class="empty" value="">
+        <button class="btn" id="open-watch-btn">開く</button>
+        <button class="btn" data-copy="u-watch">コピー</button>
+      </div>
+    </div>
+  </div>
+
+</main>
+<script>
+let siteBase = '';
+let ws = null;
+let reconnectTimer = null;
+let pollTimer = null;
+
+const $ = (id) => document.getElementById(id);
+
+function setVal(id, val, empty) {
+  const el = $(id);
+  if (!el) return;
+  el.value = val;
+  el.classList.toggle('empty', empty == null ? !val : empty);
+}
+
+function applyNgrokData(d) {
+  if (typeof d.site === 'string' && d.site) siteBase = d.site;
+  const hasNgrok = typeof d.rtmp === 'string' && d.rtmp !== '';
+  const displayUrl = hasNgrok ? d.rtmp : (d.rtmp_local || '');
+  if (displayUrl) setVal('u-rtmp', displayUrl, !hasNgrok);
+  $('ngrok-alert').classList.toggle('show', hasNgrok);
+  const lanEl = $('lan-alert');
+  lanEl.style.display = !hasNgrok && displayUrl ? 'block' : 'none';
+}
+
+function applyCapacity(active, max) {
+  const pct = max > 0 ? active / max : 0;
+  const el = $('cap');
+  el.textContent = `● ${active} / ${max}`;
+  el.style.color = pct >= 1 ? '#f85149' : pct >= 0.8 ? '#d29922' : '#56d364';
+}
+
+async function fetchFromRest() {
+  try {
+    const r = await fetch('/api/ngrok');
+    if (r.ok) applyNgrokData(await r.json());
+  } catch {}
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) { const s = await r.json(); applyCapacity(s.active, s.max); }
+  } catch {}
+}
+
+function connectWS() {
+  clearTimeout(reconnectTimer);
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => { clearInterval(pollTimer); pollTimer = null; };
+  ws.onmessage = e => {
+    let d;
+    try { d = JSON.parse(e.data); } catch { return; }
+    if (d.ping) return;
+    if ('rtmp' in d || 'site' in d) applyNgrokData(d);
+    if (d.sessions) applyCapacity(d.sessions.active, d.sessions.max);
+  };
+  ws.onclose = () => {
+    ws = null;
+    if (!pollTimer) pollTimer = setInterval(fetchFromRest, 10000);
+    reconnectTimer = setTimeout(connectWS, 5000);
+  };
+  ws.onerror = () => ws && ws.close();
+}
+
+fetchFromRest();
+connectWS();
+
+function cp(id, btn) {
+  const el = $(id);
+  if (!el || el.classList.contains('empty')) return;
+  const copy = navigator.clipboard
+    ? navigator.clipboard.writeText(el.value)
+    : Promise.reject();
+  copy.catch(() => {
+    el.select();
+    document.execCommand('copy');
+  }).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = '✓'; btn.classList.add('ok');
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('ok'); }, 2000);
+  });
+}
+
+function openWatch() {
+  const el = $('u-watch');
+  if (el && !el.classList.contains('empty')) window.open(el.value, '_blank');
+}
+
+async function checkStream() {
+  const key = $('key-input').value.trim();
+  if (!key) return;
+  $('stream-result').style.display = 'block';
+  try {
+    const r = await fetch(`/api/stream/${encodeURIComponent(key)}`);
+    if (!r.ok) { showStatus(false, '無効なキーです'); return; }
+    const d = await r.json();
+    const base = (siteBase || location.origin).replace(/\\/$/, '');
+    showStatus(d.active, d.active ? 'LIVE' : '待機中');
+    showVariants(d.variants || {});
+    setVal('u-vrc',   `${base}${d.hls_url}`, false);
+    setVal('u-watch', `${base}/watch/${encodeURIComponent(key)}`, false);
+  } catch {
+    showStatus(false, '取得失敗');
+  }
+}
+
+function showStatus(live, label) {
+  $('s-dot').className = 'status-dot ' + (live ? 'live' : 'off');
+  $('s-label').textContent = label;
+}
+
+function showVariants(variants) {
+  const el = $('variant-status');
+  const items = ['high', 'low'].map(name => {
+    const v = variants[name] || {};
+    const cls = v.ready ? 'ok' : 'wait';
+    const detail = v.ready ? `${name}: ${v.age_sec}s / ${v.bytes}B` : `${name}: 待機`;
+    return `<span class="${cls}">${detail}</span>`;
+  });
+  el.innerHTML = items.join('');
+}
+
+document.querySelectorAll('[data-copy]').forEach(btn => {
+  btn.addEventListener('click', () => cp(btn.dataset.copy, btn));
+});
+
+$('check-btn').addEventListener('click', checkStream);
+$('open-watch-btn').addEventListener('click', openWatch);
+$('key-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') checkStream();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>視聴中 — SYCS</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;background:#000;overflow:hidden}
+#wrap{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+video{width:100%;height:100%;object-fit:contain}
+#msg{position:absolute;color:#8b949e;font-family:'Segoe UI',system-ui,sans-serif;font-size:.9rem;pointer-events:none;text-align:center;padding:8px;text-shadow:0 1px 2px #000}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" controls autoplay playsinline></video>
+  <p id="msg">配信待機中...</p>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<script>
+const KEY = __KEY_JSON__;
+const RETRY_MS = 3000;
+
+// ─── WebSocket HLS 共有状態 ───────────────────────────────────────────────────
+const _ws = {
+  conn:         null,
+  master:       null,         // master content string | null
+  masterWaiters: [],          // [resolve fn]
+  levels:       {},           // 'high'|'low' → content string
+  levelWaiters: {},           // 'high'|'low' → [{msn,part,resolve,timer}]
+};
+
+// ─── LL-HLS ユーティリティ ────────────────────────────────────────────────────
+function _parseMsn(url) {
+  try {
+    const u = new URL(url, location.href);
+    const msn  = u.searchParams.get('_HLS_msn');
+    const part = u.searchParams.get('_HLS_part');
+    return {
+      msn:  msn  !== null ? parseInt(msn,  10) : null,
+      part: part !== null ? parseInt(part, 10) : null,
+    };
+  } catch { return { msn: null, part: null }; }
+}
+
+function _hlsSatisfies(content, msn, part) {
+  if (msn === null) return true;
+  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\\d+)/);
+  if (!seqM) return false;
+  const base   = parseInt(seqM[1], 10);
+  const segs   = (content.match(/#EXTINF:/g) || []).length;
+  const maxMsn = base + segs - 1;
+  if (msn <= maxMsn) return true;    // 完了済みセグメント (part の有無に関わらず)
+  if (msn > maxMsn + 1) return false; // 未存在セグメント
+  // msn === maxMsn + 1: 現在構築中の partial セグメント
+  if (part === null) return false;
+  // 末尾の partial セグメントのパーツ数を数える
+  const lastInfPos = content.lastIndexOf('#EXTINF:');
+  let tail = content;
+  if (lastInfPos >= 0) {
+    const nl1 = content.indexOf('\\n', lastInfPos);
+    const nl2 = nl1 >= 0 ? content.indexOf('\\n', nl1 + 1) : -1;
+    tail = content.slice(nl2 + 1);
+  }
+  return (tail.match(/#EXT-X-PART:/g) || []).length > part;
+}
+
+function _deliverLevel(variant, content) {
+  _ws.levels[variant] = content;
+  const pending = (_ws.levelWaiters[variant] || []).splice(0);
+  const remaining = [];
+  for (const req of pending) {
+    if (_hlsSatisfies(content, req.msn, req.part)) {
+      clearTimeout(req.timer);
+      req.resolve(content);
+    } else {
+      remaining.push(req);
+    }
+  }
+  _ws.levelWaiters[variant] = remaining;
+}
+
+// ─── カスタム pLoader (プレイリストを WebSocket から受け取る) ─────────────────
+function _newLoaderStats() {
+  const now = performance.now();
+  return {
+    trequest: now,
+    tfirst: 0,
+    tload: 0,
+    aborted: false,
+    loaded: 0,
+    retry: 0,
+    total: 0,
+    chunkCount: 0,
+    bwEstimate: 0,
+    loading: { start: now, first: 0, end: 0 },
+    parsing: { start: 0, end: 0 },
+    buffering: { start: 0, first: 0, end: 0 },
+  };
+}
+
+class WsPlaylistLoader {
+  constructor(_config) {
+    this._aborted = false;
+    this._pending = null;
+    this.context = null;
+    this.stats = _newLoaderStats();
+  }
+
+  load(ctx, config, callbacks) {
+    this._aborted = false;
+    this.context = ctx;
+    this.stats = _newLoaderStats();
+
+    const deliver = (content) => {
+      if (this._aborted) return;
+      const t = performance.now();
+      this.stats.loaded = content.length;
+      this.stats.total = content.length;
+      this.stats.tfirst = t;
+      this.stats.tload = t;
+      this.stats.loading.first = t;
+      this.stats.loading.end = t;
+      callbacks.onSuccess({ data: content, url: ctx.url }, this.stats, ctx);
+    };
+
+    if (ctx.type === 'manifest') {
+      if (_ws.master !== null) { setTimeout(() => deliver(_ws.master), 0); return; }
+      _ws.masterWaiters.push(deliver);
+      return;
+    }
+
+    if (ctx.type === 'level') {
+      const variant = ctx.url.includes('_transcode') ? 'low' : 'high';
+      const { msn, part } = _parseMsn(ctx.url);
+      const latest = _ws.levels[variant];
+      if (latest !== undefined && _hlsSatisfies(latest, msn, part)) {
+        setTimeout(() => deliver(latest), 0);
+        return;
+      }
+      const timer = setTimeout(() => {
+        this._removePending();
+        this.stats.loading.end = performance.now();
+        callbacks.onTimeout(this.stats, ctx);
+      }, config.timeout || 10000);
+      this._pending = { variant, msn, part, resolve: deliver, timer };
+      if (!_ws.levelWaiters[variant]) _ws.levelWaiters[variant] = [];
+      _ws.levelWaiters[variant].push(this._pending);
+      return;
+    }
+
+    callbacks.onError({ code: 400, text: `Unsupported playlist type: ${ctx.type}` }, ctx);
+  }
+
+  _removePending() {
+    if (!this._pending) return;
+    const list = _ws.levelWaiters[this._pending.variant] || [];
+    const idx = list.indexOf(this._pending);
+    if (idx >= 0) list.splice(idx, 1);
+    this._pending = null;
+  }
+
+  abort() {
+    this._aborted = true;
+    this.stats.aborted = true;
+    if (this._pending) { clearTimeout(this._pending.timer); this._removePending(); }
+  }
+
+  getCacheAge() { return 0; }
+
+  destroy() { this.abort(); }
+}
+
+// ─── プレイヤー制御 ───────────────────────────────────────────────────────────
+let _hls     = null;
+let _hlsUp   = false;
+let _retryTm = null;
+let _pollTm  = null;
+let _mediaRecoveries = 0;
+
+function _msg(text) { document.getElementById('msg').style.display = text ? '' : 'none';
+                      document.getElementById('msg').textContent   = text || ''; }
+
+function _startHls() {
+  if (_hlsUp) return;
+  if (!window.Hls || !Hls.isSupported()) {
+    _msg('このブラウザは hls.js 再生に対応していません。');
+    return;
+  }
+  _hlsUp = true;
+  clearInterval(_pollTm); _pollTm = null;
+  _mediaRecoveries = 0;
+  _msg(null);
+
+  const video = document.getElementById('v');
+  if (_hls) _hls.destroy();
+  _hls = new Hls({
+    lowLatencyMode:             true,
+    backBufferLength:           2,
+    maxBufferLength:            4,
+    liveSyncDurationCount:      1,
+    liveMaxLatencyDurationCount: 3,
+    maxLiveSyncPlaybackRate:    1.2,
+    liveDurationInfinity:       true,
+    pLoader:                    WsPlaylistLoader,
+  });
+  _hls.loadSource(`/hls/live/${KEY}/master.m3u8`);
+  _hls.attachMedia(video);
+  _hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+    if (data.levels && data.levels.length > 1) _hls.startLevel = 1;
+    video.play().catch(() => {});
+  });
+  _hls.on(Hls.Events.ERROR, (_, d) => {
+    if (!d.fatal) return;
+    if (d.type === Hls.ErrorTypes.MEDIA_ERROR && _mediaRecoveries < 2) {
+      _mediaRecoveries += 1;
+      _hls.recoverMediaError();
+      return;
+    }
+    _reconnect('再接続中...');
+  });
+}
+
+function _resetWsState() {
+  _ws.master = null;
+  _ws.masterWaiters.length = 0;
+  _ws.levels = {};
+  for (const list of Object.values(_ws.levelWaiters)) {
+    for (const r of list.splice(0)) clearTimeout(r.timer);
+  }
+  _ws.levelWaiters = {};
+}
+
+function _reconnect(message = '接続中...') {
+  if (_hls) { _hls.destroy(); _hls = null; _hlsUp = false; }
+  if (_ws.conn) {
+    const old = _ws.conn;
+    _ws.conn = null;
+    old.close();
+  }
+  _resetWsState();
+  _msg(message);
+  clearTimeout(_retryTm);
+  _retryTm = setTimeout(_initWs, RETRY_MS);
+}
+
+// ─── WebSocket 接続 ───────────────────────────────────────────────────────────
+async function _initWs() {
+  clearTimeout(_retryTm);
+  _retryTm = null;
+  _msg('接続中...');
+
+  let token;
+  try {
+    const r = await fetch(`/api/token/${encodeURIComponent(KEY)}`);
+    if (!r.ok) throw new Error();
+    token = (await r.json()).token;
+  } catch { _reconnect('接続中...'); return; }
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(
+    `${proto}//${location.host}/ws/hls/${encodeURIComponent(KEY)}?token=${encodeURIComponent(token)}`
+  );
+  _ws.conn = ws;
+  ws.onopen = () => _msg('プレイリスト待機中...');
+
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'ping') return;
+    if (msg.type === 'master') {
+      _ws.master = msg.content;
+      for (const fn of _ws.masterWaiters.splice(0)) fn(msg.content);
+      if (!_hlsUp) _startHls();
+    }
+    if (msg.type === 'level') _deliverLevel(msg.variant, msg.content);
+  };
+
+  ws.onclose = () => {
+    if (_ws.conn !== ws) return;
+    _ws.conn = null;
+    _reconnect('再接続中...');
+  };
+  ws.onerror = () => {
+    if (ws.readyState !== WebSocket.CLOSED) ws.close();
+  };
+}
+
+// ─── 起動 ────────────────────────────────────────────────────────────────────
+(async () => {
+  async function isActive() {
+    try {
+      const r = await fetch(`/api/stream/${encodeURIComponent(KEY)}`);
+      return r.ok && (await r.json()).active;
+    } catch { return false; }
+  }
+
+  if (await isActive()) {
+    _initWs();
+  } else {
+    _msg('配信待機中...');
+    _pollTm = setInterval(async () => {
+      if (await isActive()) { clearInterval(_pollTm); _pollTm = null; _initWs(); }
+    }, 3000);
+  }
+})();
+</script>
+</body>
+</html>

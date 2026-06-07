@@ -271,7 +271,7 @@ docker exec sycs-media-server cat /tmp/publish_{ストリームキー}.log
 docker exec sycs-media-server find /hls -maxdepth 3 -type f | head
 # LL-HLSではvolume上にm3u8が無く、*_video*_seg*.mp4 / *_audio*_seg*.mp4 だけ見えることがあります
 # LL-HLS プレイリストがMediaMTXから取れるか確認
-curl -fsS http://127.0.0.1:8888/{ストリームキー}/index.m3u8 | head
+curl -fsSL http://127.0.0.1:8888/{ストリームキー}/index.m3u8 | head
 # APIサーバーから見たHLS/権限/MediaMTX実パスを確認
 curl -fsS http://127.0.0.1:8080/api/debug/stream/{ストリームキー}
 ```

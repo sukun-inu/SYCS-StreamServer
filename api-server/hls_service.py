@@ -317,8 +317,8 @@ class HlsService:
 
     async def playlist_state(self, key: str) -> dict[str, dict]:
         variants = {
-            "high": f"{key}/stream.m3u8",
-            "low": f"live/{key}_transcode/stream.m3u8",
+            "high": f"{key}/index.m3u8",
+            "low": f"live/{key}_transcode/index.m3u8",
         }
 
         async def variant_state(name: str, rel_path: str) -> tuple[str, dict]:
@@ -348,8 +348,8 @@ class HlsService:
         return dict(pairs)
 
     async def debug_stream(self, key: str) -> dict:
-        high_rel = f"{key}/stream.m3u8"
-        low_rel = f"live/{key}_transcode/stream.m3u8"
+        high_rel = f"{key}/index.m3u8"
+        low_rel = f"live/{key}_transcode/index.m3u8"
         high_candidates = self.playlist_rel_path_candidates(high_rel)
         low_candidates = self.playlist_rel_path_candidates(low_rel)
 
@@ -476,9 +476,9 @@ class HlsService:
             "#EXTM3U\n"
             "#EXT-X-VERSION:6\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high\n"
-            f"/hls/live/{key}/stream.m3u8\n"
+            f"/hls/live/{key}/index.m3u8\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low\n"
-            f"/hls/live/{key}_transcode/stream.m3u8\n"
+            f"/hls/live/{key}_transcode/index.m3u8\n"
         )
 
     def build_http_master_content(self, key: str) -> str:
@@ -486,9 +486,9 @@ class HlsService:
             "#EXTM3U\n"
             "#EXT-X-VERSION:6\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,NAME=high\n"
-            "stream.m3u8\n"
+            "index.m3u8\n"
             "#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,NAME=low\n"
-            f"../{key}_transcode/stream.m3u8\n"
+            f"../{key}_transcode/index.m3u8\n"
         )
 
     def rel_path_candidates(self, rel_path: str) -> list[str]:
@@ -510,11 +510,12 @@ class HlsService:
 
     def playlist_rel_path_candidates(self, rel_path: str) -> list[str]:
         rel_path = self._normalize_rel_path(rel_path)
-        names = [rel_path]
         if rel_path.endswith("/stream.m3u8"):
-            names.append(rel_path.removesuffix("stream.m3u8") + "index.m3u8")
+            names = [rel_path.removesuffix("stream.m3u8") + "index.m3u8", rel_path]
         elif rel_path.endswith("/index.m3u8"):
-            names.append(rel_path.removesuffix("index.m3u8") + "stream.m3u8")
+            names = [rel_path, rel_path.removesuffix("index.m3u8") + "stream.m3u8"]
+        else:
+            names = [rel_path]
 
         candidates: list[str] = []
         for name in names:
@@ -589,9 +590,15 @@ class HlsService:
                 return None
             seen.update(batch)
 
-            fetched_items = await self._fetch_many_mediamtx(batch, params=params)
             child_candidates: list[str] = []
-            for fetched in fetched_items:
+            for rel_path in batch:
+                fetched = await self._fetch_first_mediamtx(
+                    [rel_path],
+                    params=params,
+                    content_filter=lambda data: self._playlist_bytes_match(data, media_only=False),
+                )
+                if fetched is None:
+                    continue
                 try:
                     content = fetched.content.decode("utf-8")
                 except UnicodeDecodeError:
@@ -604,33 +611,6 @@ class HlsService:
             pending = self._unique_safe_rel_paths(child_candidates)
         return None
 
-    async def _fetch_many_mediamtx(
-        self,
-        rel_paths: list[str],
-        params: dict[str, int] | None = None,
-    ) -> list[MediaFetch]:
-        rel_paths = self._unique_safe_rel_paths(rel_paths)
-        if not rel_paths:
-            return []
-
-        client = self._client
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=MEDIAMTX_HLS_TIMEOUT)
-            close_client = True
-
-        tasks = [
-            self._fetch_mediamtx_url(client, base_url, rel_path, params=params)
-            for rel_path in rel_paths
-            for base_url in MEDIAMTX_HLS_URLS
-        ]
-        try:
-            results = await asyncio.gather(*tasks)
-            return [result for result in results if result is not None]
-        finally:
-            if close_client:
-                await client.aclose()
-
     async def _fetch_mediamtx_url(
         self,
         client: httpx.AsyncClient,
@@ -639,7 +619,11 @@ class HlsService:
         params: dict[str, int] | None = None,
     ) -> MediaFetch | None:
         try:
-            resp = await client.get(self._mediamtx_hls_url(base_url, rel_path), params=params)
+            resp = await client.get(
+                self._mediamtx_hls_url(base_url, rel_path),
+                params=params,
+                follow_redirects=True,
+            )
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -674,7 +658,7 @@ class HlsService:
         url = self._mediamtx_hls_url(base_url, rel_path)
         result = {"base_url": base_url, "rel_path": rel_path, "url": url}
         try:
-            resp = await client.get(url)
+            resp = await client.get(url, follow_redirects=True)
             text = resp.text[:240] if resp.headers.get("content-type", "").startswith(("application", "text")) else ""
             result.update(
                 {

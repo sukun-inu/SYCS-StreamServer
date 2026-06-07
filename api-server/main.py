@@ -189,8 +189,8 @@ async def ws_hls(ws: WebSocket, key: str, token: str = Query(...)):
 
     await ws.accept()
 
-    high_rel = f"{key}/stream.m3u8"
-    low_rel = f"live/{key}_transcode/stream.m3u8"
+    high_rel = f"{key}/index.m3u8"
+    low_rel = f"live/{key}_transcode/index.m3u8"
     rel_paths = (high_rel, low_rel)
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=30)
     await hls.add_playlist_queue(rel_paths, queue)

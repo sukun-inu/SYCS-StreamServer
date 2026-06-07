@@ -8,6 +8,7 @@ rtspAddress: :8554
 # FFmpeg ではなく mediamtx が EXT-X-PART 付き LL-HLS を生成する。
 # hlsDirectory に書き出したファイルを api-server が静的配信する。
 hls: yes
+hlsAlwaysRemux: yes        # api-server が /hls を静的配信するため、視聴要求なしでも生成する
 hlsVariant: lowLatency     # EXT-X-PART / EXT-X-SERVER-CONTROL 付き
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
@@ -20,4 +21,4 @@ srt: no
 paths:
   all_others:
     runOnReady: /usr/local/bin/publish.sh
-    runOnReadyRestart: yes
+    runOnReadyRestart: no  # 再起動は publish.sh 内で制御し、_transcode の再帰再起動を避ける

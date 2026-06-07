@@ -262,6 +262,7 @@ docker exec sycs-media-server ls /hls/live/
 
 よくある原因:
 - OBS のキーフレーム間隔が 1 秒以外に設定されている
+- `media-server/mediamtx.yml` の `hlsAlwaysRemux: yes` が無効で、MediaMTX が `/hls` へ常時書き出していない
 - GPU が認識されていない (下記参照)
 
 ### GPU が認識されない / NVENC が使えない
@@ -295,7 +296,7 @@ docker compose logs api-server
 
 1. OBS のキーフレーム間隔を **1 秒固定** に設定する
 2. ブラウザの DevTools → Network で `/ws/hls/{key}` の WebSocket が接続されているか確認
-3. `media-server/mediamtx.yml` の `hlsPartDuration: 100ms` が設定されているか確認
+3. `media-server/mediamtx.yml` の `hlsAlwaysRemux: yes` と `hlsPartDuration: 100ms` が設定されているか確認
 
 ### Cloudflare Tunnel 経由でアクセスできない
 

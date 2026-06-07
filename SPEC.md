@@ -76,6 +76,7 @@ mediamtx
 
 | 設定 | 値 | 意味 |
 |------|----|------|
+| `hlsAlwaysRemux` | `yes` | API サーバーが `/hls` の静的ファイルを読むため、MediaMTX のHLSエンドポイントに視聴者がいなくても生成 |
 | `hlsVariant` | `lowLatency` | EXT-X-PART / EXT-X-SERVER-CONTROL 有効 |
 | `hlsSegmentDuration` | `1s` | 1 セグメント長 |
 | `hlsPartDuration` | `100ms` | 1 パーツ長 (LL-HLS 最小粒度) |

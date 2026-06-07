@@ -229,13 +229,43 @@ def _playlist_satisfies(content: str, msn: int, part: int | None) -> bool:
     if not m:
         return False
     base    = int(m.group(1))
-    max_msn = base + content.count("#EXTINF:") - 1
-    if msn > max_msn:
+    segs    = content.count("#EXTINF:")
+    max_msn = base + segs - 1
+    if msn <= max_msn:
+        return True
+    if msn > max_msn + 1:
         return False
     if part is None:
-        return True
-    part_uris = re.findall(r'#EXT-X-PART:[^,\n]*,URI="([^"]+)"', content)
-    return len([u for u in part_uris if re.search(rf"seg{msn:05d}\.", u)]) > part
+        return False
+
+    tail = content
+    last_inf = content.rfind("#EXTINF:")
+    if last_inf >= 0:
+        first_nl = content.find("\n", last_inf)
+        second_nl = content.find("\n", first_nl + 1) if first_nl >= 0 else -1
+        if second_nl >= 0:
+            tail = content[second_nl + 1:]
+    return tail.count("#EXT-X-PART:") > part
+
+
+def _playlist_state(key: str) -> dict:
+    variants = {
+        "high": HLS_DIR / "live" / key / "index.m3u8",
+        "low":  HLS_DIR / "live" / f"{key}_transcode" / "index.m3u8",
+    }
+    state: dict[str, dict] = {}
+    now = time.time()
+    for name, path in variants.items():
+        try:
+            st = path.stat()
+            state[name] = {
+                "ready": True,
+                "age_sec": max(0.0, round(now - st.st_mtime, 3)),
+                "bytes": st.st_size,
+            }
+        except OSError:
+            state[name] = {"ready": False}
+    return state
 
 
 # ─── Playlist パッチ処理 ──────────────────────────────────────────────────────
@@ -475,12 +505,13 @@ async def health():
 async def stream_info(key: str):
     if not _KEY_RE.match(key):
         raise HTTPException(400, "無効なストリームキーです。")
-    stream_dir = HLS_DIR / "live" / key
-    active = (stream_dir / "index.m3u8").exists()
+    variants = _playlist_state(key)
+    active = variants["high"]["ready"]
     return {
         "key":     key,
         "active":  active,
         "hls_url": f"/hls/live/{key}/master.m3u8",
+        "variants": variants,
     }
 
 

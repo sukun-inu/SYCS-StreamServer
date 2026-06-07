@@ -33,14 +33,18 @@ echo "[publish:$$] $(date -u +%FT%TZ) start key=${STREAM_NAME} MTX_PATH=${MTX_PA
 
 VIDEO_BITRATE_LOW="${VIDEO_BITRATE_LOW:-2000k}"
 AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
+TRANSCODE_RESTART_DELAY="${TRANSCODE_RESTART_DELAY:-1}"
 
 PID=""
+SLEEP_PID=""
 FFMPEG_EXIT=0
 
 cleanup() {
     trap - EXIT TERM INT HUP
     [ -n "${PID}" ] && kill "${PID}" 2>/dev/null || true
     wait "${PID}" 2>/dev/null || true
+    [ -n "${SLEEP_PID}" ] && kill "${SLEEP_PID}" 2>/dev/null || true
+    wait "${SLEEP_PID}" 2>/dev/null || true
     flock -u 9 2>/dev/null || true
     exit "${FFMPEG_EXIT}"
 }
@@ -71,22 +75,32 @@ else
     KF=(-g 60 -keyint_min 60 -sc_threshold 0)
 fi
 
-echo "[publish:${STREAM_NAME}] starting ffmpeg transcode..."
-ffmpeg \
-    -loglevel warning \
-    -rtsp_transport tcp \
-    -fflags +genpts \
-    -use_wallclock_as_timestamps 1 \
-    -i "${INPUT}" \
-    -vf "scale=-2:720" \
-    "${VC[@]}" \
-    "${KF[@]}" \
-    -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -af "aresample=async=1000" \
-    -f flv "${OUTPUT}" &
-PID=$!
-echo "[publish:${STREAM_NAME}] ffmpeg PID=${PID}"
+while true; do
+    FFMPEG_EXIT=0
+    PID=""
+    echo "[publish:${STREAM_NAME}] starting ffmpeg transcode..."
+    ffmpeg \
+        -loglevel warning \
+        -rtsp_transport tcp \
+        -fflags +genpts \
+        -use_wallclock_as_timestamps 1 \
+        -i "${INPUT}" \
+        -vf "scale=-2:720" \
+        "${VC[@]}" \
+        "${KF[@]}" \
+        -force_key_frames "expr:gte(t,n_forced*1)" \
+        -c:a aac -b:a "${AUDIO_BITRATE}" -ar 44100 -af "aresample=async=1000" \
+        -f flv "${OUTPUT}" &
+    PID=$!
+    echo "[publish:${STREAM_NAME}] ffmpeg PID=${PID}"
 
-wait "${PID}" 2>/dev/null || FFMPEG_EXIT=$?
-FFMPEG_EXIT="${FFMPEG_EXIT:-0}"
-echo "[publish:${STREAM_NAME}] ffmpeg exited with code ${FFMPEG_EXIT}"
-exit "${FFMPEG_EXIT}"
+    wait "${PID}" 2>/dev/null || FFMPEG_EXIT=$?
+    PID=""
+    FFMPEG_EXIT="${FFMPEG_EXIT:-0}"
+    echo "[publish:${STREAM_NAME}] ffmpeg exited with code ${FFMPEG_EXIT}; restarting in ${TRANSCODE_RESTART_DELAY}s while source is ready"
+
+    sleep "${TRANSCODE_RESTART_DELAY}" &
+    SLEEP_PID=$!
+    wait "${SLEEP_PID}" 2>/dev/null || true
+    SLEEP_PID=""
+done

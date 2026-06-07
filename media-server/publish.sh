@@ -3,8 +3,11 @@
 # 環境変数 MTX_PATH="live/..." でストリームパスを受け取る。
 
 STREAM_NAME="${MTX_PATH##*/}"
-if [ -z "${STREAM_NAME}" ]; then
-    echo "$(date -u +%FT%TZ) [publish-error] MTX_PATH 未設定または不正: '${MTX_PATH}'" >&2
+
+# ストリームキーのバリデーション: 英数字・ハイフン・アンダースコアのみ許可。
+# ".." などのパストラバーサル文字を含む場合はコンテナ内ディレクトリ走査のリスクがある。
+if [[ ! "${STREAM_NAME}" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    echo "$(date -u +%FT%TZ) [publish-error] 無効な STREAM_NAME: '${STREAM_NAME}' (MTX_PATH='${MTX_PATH}')" >&2
     exit 1
 fi
 
@@ -14,6 +17,8 @@ LOCK="/tmp/publish_${STREAM_NAME}.lock"
 exec 9>"${LOCK}"
 if ! flock -n 9; then
     echo "$(date -u +%FT%TZ) [publish] ${STREAM_NAME} already running, exit" >&2
+    # EXIT トラップを除去してから終了: PID 未設定で cleanup を呼ばせない
+    trap - EXIT TERM INT HUP
     exit 0
 fi
 
@@ -37,7 +42,7 @@ FFMPEG_EXIT=0
 
 cleanup() {
     trap - EXIT TERM INT HUP
-    [ -n "${PID}" ] && kill "${PID}" 2>/dev/null
+    [ -n "${PID}" ] && kill "${PID}" 2>/dev/null || true
     wait "${PID}" 2>/dev/null || true
     flock -u 9 2>/dev/null || true
     exit "${FFMPEG_EXIT}"
@@ -73,18 +78,40 @@ else
     )
 fi
 
+# 音声ストリームの有無を確認: 映像のみの OBS 設定では -map 0:a がエラーになる
+HAS_AUDIO=0
+if ffprobe -v quiet -rtsp_transport tcp \
+           -show_streams -select_streams a \
+           -i "${INPUT}" 2>/dev/null | grep -q "codec_type=audio"; then
+    HAS_AUDIO=1
+fi
+
+if [ "${HAS_AUDIO}" -eq 1 ]; then
+    AUDIO_MAPS=(-map "[vh]" -map 0:a -map "[vls]" -map 0:a)
+    AUDIO_ENCODE=(
+        -c:a:0 aac -ar:a:0 44100 -b:a:0 "${AUDIO_BITRATE}" -af:a:0 "aresample=async=1000"
+        -c:a:1 aac -ar:a:1 44100 -b:a:1 128k              -af:a:1 "aresample=async=1000"
+    )
+    VAR_MAP="v:0,a:0,name:high v:1,a:1,name:low"
+else
+    echo "[publish:${STREAM_NAME}] 音声なし — 映像のみでエンコード"
+    AUDIO_MAPS=(-map "[vh]" -map "[vls]")
+    AUDIO_ENCODE=()
+    VAR_MAP="v:0,name:high v:1,name:low"
+fi
+
 ffmpeg \
     -loglevel warning \
     -rtsp_transport tcp \
+    -fflags +genpts \
+    -use_wallclock_as_timestamps 1 \
     -i "${INPUT}" \
     -filter_complex "[0:v]split=2[vh][vl];[vl]scale=-2:720[vls]" \
-    -map "[vh]"  -map 0:a \
-    -map "[vls]" -map 0:a \
+    "${AUDIO_MAPS[@]}" \
     "${VC[@]}" \
     -g:v:0 60 -keyint_min:v:0 60 -sc_threshold:v:0 0 \
     -g:v:1 60 -keyint_min:v:1 60 -sc_threshold:v:1 0 \
-    -c:a:0 aac -ar:a:0 44100 -b:a:0 "${AUDIO_BITRATE}" -af:a:0 "aresample=async=1000" \
-    -c:a:1 aac -ar:a:1 44100 -b:a:1 128k              -af:a:1 "aresample=async=1000" \
+    "${AUDIO_ENCODE[@]}" \
     -f hls \
     -hls_time "${HLS_SEGMENT_TIME}" \
     -hls_list_size "${HLS_LIST_SIZE}" \
@@ -94,7 +121,7 @@ ffmpeg \
     -hls_part_duration "${HLS_PART_DURATION}" \
     -hls_segment_filename "${OUTPUT_DIR}/%v/seg%05d.m4s" \
     -master_pl_name master.m3u8 \
-    -var_stream_map "v:0,a:0,name:high v:1,a:1,name:low" \
+    -var_stream_map "${VAR_MAP}" \
     "${OUTPUT_DIR}/%v/index.m3u8" &
 PID=$!
 

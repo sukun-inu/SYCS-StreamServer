@@ -35,9 +35,11 @@ NGROK_RTMP_API = os.environ.get("NGROK_RTMP_API", "http://localhost:4040")
 _NGROK_TTL     = float(os.environ.get("NGROK_CACHE_TTL", "30"))
 
 MAX_SESSIONS    = int(os.environ.get("MAX_SESSIONS",    "100"))
-SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "8.0"))
+# SESSION_TIMEOUT はブロッキングタイムアウト (5s) + 余裕を考慮して 15s 以上を推奨。
+# 8s だとブロッキング中にクリーンアップが走りセッションが消える可能性がある。
+SESSION_TIMEOUT = float(os.environ.get("SESSION_TIMEOUT", "15.0"))
 QUEUE_TIMEOUT   = float(os.environ.get("QUEUE_TIMEOUT",  "20.0"))
-MAX_BPS         = int(os.environ.get("MAX_BPS", str(11 * 1_000_000 // 8)))
+MAX_BPS         = int(os.environ.get("MAX_BPS", str(3_000_000)))
 
 _KEY_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 
@@ -428,9 +430,10 @@ async def serve_hls(
     is_master   = path.endswith("master.m3u8")
     is_playlist = path.endswith("index.m3u8")
 
-    # パストラバーサル防止
+    # パストラバーサル防止: resolve() で ".." を展開してから比較する。
+    # relative_to() のみでは "/hls/../../etc/passwd" が ValueError を投げないため不十分。
     try:
-        file_path.relative_to(HLS_DIR)
+        file_path.resolve().relative_to(HLS_DIR.resolve())
     except ValueError:
         raise HTTPException(400, "Invalid path")
 

@@ -57,9 +57,9 @@ OBS Studio
 
 | 経路 | 遅延 |
 |------|------|
-| ローカルネットワーク視聴 (ブラウザ) | ~300〜400ms |
-| Cloudflare 経由 (ブラウザ LL-HLS) | ~500〜800ms |
-| Cloudflare 経由 (VRChat) | ~1〜1.5s |
+| ローカルネットワーク視聴 (ブラウザ) | ~400〜700ms |
+| Cloudflare 経由 (ブラウザ LL-HLS) | ~700ms〜1.3s |
+| Cloudflare 経由 (VRChat) | ~2〜3s |
 
 ---
 

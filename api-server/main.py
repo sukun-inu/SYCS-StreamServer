@@ -958,20 +958,21 @@ function _parseMsn(url) {
 
 function _hlsSatisfies(content, msn, part) {
   if (msn === null) return true;
-  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+  const seqM = content.match(/#EXT-X-MEDIA-SEQUENCE:(\\d+)/);
   if (!seqM) return false;
-  const base  = parseInt(seqM[1], 10);
-  const segs  = (content.match(/#EXTINF:/g) || []).length;
+  const base   = parseInt(seqM[1], 10);
+  const segs   = (content.match(/#EXTINF:/g) || []).length;
   const maxMsn = base + segs - 1;
-  if (msn < maxMsn) return true;   // 完了済みセグメント
-  if (msn > maxMsn + 1) return false;
-  if (part === null) return msn <= maxMsn;
+  if (msn <= maxMsn) return true;    // 完了済みセグメント (part の有無に関わらず)
+  if (msn > maxMsn + 1) return false; // 未存在セグメント
+  // msn === maxMsn + 1: 現在構築中の partial セグメント
+  if (part === null) return false;
   // 末尾の partial セグメントのパーツ数を数える
   const lastInfPos = content.lastIndexOf('#EXTINF:');
   let tail = content;
   if (lastInfPos >= 0) {
     const nl1 = content.indexOf('\\n', lastInfPos);
-    const nl2 = content.indexOf('\\n', nl1 + 1);
+    const nl2 = nl1 >= 0 ? content.indexOf('\\n', nl1 + 1) : -1;
     tail = content.slice(nl2 + 1);
   }
   return (tail.match(/#EXT-X-PART:/g) || []).length > part;
